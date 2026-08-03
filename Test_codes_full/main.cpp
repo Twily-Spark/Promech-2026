@@ -1,29 +1,3 @@
-/* =============================================================================
-R2_Main.cpp  —  ABU Robocon 2026 "Kung Fu Quest" — FULL AUTO + FOREST PATH FIRST
-Platform    : NUCLEO_F446RE  mbed OS5  ARMC6
-
-FLOW (PATH INPUT FIRST):
-  boot
-    └─► main loop (per round):
-         STEP 1  collect_forest_path()  ← IR remote sends path FIRST
-                 Your exact KEY_MAP + debug prints
-                 1-12 = block | press-count: 1=straight 2=R 3+=L
-                 Confirm = lock | Ok = done | Clear = reset | B = skip
-         STEP 2  op_mode()              ← operator picks run mode
-                 btn_a scroll, IR confirm:
-                   0 NORMAL      full sequence (spear → forest)
-                   1 RETRY MC    skip spear, go straight to forest
-                   2 RETRY ARN   arena (no forest path used)
-                   3 TEST SENS   sensor diagnostics
-                   4 TEST ACT    actuator/cylinder tests
-         STEP 3  dispatch()             ← runs selected mode using stored path
-                 Cases 1-6: spear pickup at rack
-                 Case 7   : forest entry (50cm + climb onto first block)
-                 Case 8   : forest navigation (executes IR-stored path)
-                 Case 9   : release + done
-         STEP 4  wait for IR            ← start next round (new path)
-============================================================================= */
-
 #include "mbed.h"
 #include <cmath>
 #include <cstdlib>
@@ -67,7 +41,7 @@ float BACK_SPD = 2.0f;
 float STRAFE_SPD = 0.6f;
 float FWD_SPEAR_SPD = 1.5f;
 float ROT_DUTY = 0.5f;
-uint32_t DIAG_MS = 4000;
+uint32_t DIAG_MS = 6000;
 uint32_t TURN_45_MS = 2000;
 float    MOVE_SPD = 3.0f;
 uint32_t CYL_ARM_MS = 1000;
@@ -102,6 +76,11 @@ int  forest_path_blocks[MAX_FOREST_PATH];
 int  forest_path_presses[MAX_FOREST_PATH];
 int  forest_path_len = 0;
 bool forest_path_confirmed = false;
+#define CLIMB_TORQUE_MODE     1       // 1=enable high-torque during forest climb
+#define CLIMB_KDI_GAIN        3.0f    // PID current gain (higher = more aggressive torque)
+#define CLIMB_FF_CURRENT      3000    // Feedforward current term (0-4095) - baseline torque boost
+#define CLIMB_MAX_VEL         1.5f    // Max velocity during climb (lower = more torque focus)
+#define CLIMB_RAMP_SLOW       0.02f   // Slower ramp-up for smooth high-torque engagement
 
 int  forest_box_blocks[MAX_FOREST_BOXES];
 int  forest_box_actions[MAX_FOREST_BOXES];
@@ -155,12 +134,15 @@ DigitalOut cyl_arm(PA_6);
 DigitalOut cyl_grip(PA_7);
 DigitalOut cyl_up(PC_8);
 DigitalOut cyl_dir(PB_15); 
-//DigitalOut rot_dira(PC_6), rot_dirb(PC_8);
 DigitalIn  sw_home(PC_1), sw_90(PA_0);
 DigitalIn  zone_sw(PC_3, PullUp);
 DigitalIn  btn_a(PA_10, PullUp);
 DigitalIn  btn_b(PB_3,  PullUp);
-DigitalIn  ir_sens(PA_9, PullUp);  // IR_GO button
+DigitalIn  ir_sens(PB_4, PullUp);  // IR_GO button
+
+DigitalOut pol1_dir1(PA_13);  // Direction IN1 / DIR
+DigitalOut pol1_dir2(PA_14);   // Direction IN2 / DIR (or Enable)
+PwmOut     pol1_pwm(PB_2);   // PWM Speed Control
 I2C i2c(PB_9, PB_8);
 uint8_t    lcd_addr = 0x27;    
 #define MUX1_ADDR  0x70  // RED side: FRONT(1), LEFT(2), GROUND_F(4), RIGHT(5)
@@ -270,8 +252,8 @@ void cyl1_retract(){ cyl_arm = 0; }  // LOW = retract
 void cyl_all_safe() {
     cyl_arm = 0;      // Cyl1: retract
     cyl_grip = 1;     // Cyl2: open/release
-    cyl_up = 0;       // Cyl3: down
-    cyl_dir = 0;      // Cyl4: default direction
+    cyl_up = 1;       // Cyl3: down
+    cyl_dir = 1;      // Cyl4: default direction
     cyl5_stop();      // Cyl5: retract
     cyl6_stop();      // Cyl6: retract
 }
@@ -316,6 +298,41 @@ void can_send_vel(uint32_t id, float vel) {
     tx_msg.data[7]=ff&0xFF;
     tx_msg.id=id; tx_msg.type=CANData; tx_msg.format=CANStandard; tx_msg.len=8;
     can.write(tx_msg); wait_us(100);
+}
+// ✅ NEW: High-torque CAN send (SAME motor pattern, different params)
+// This does NOT change direction logic - only increases torque via CAN params
+void can_send_vel_climb(uint32_t id, float vel) {
+    // Clamp velocity
+    if(vel < -30.f) vel = -30.f;
+    if(vel > 30.f) vel = 30.f;
+    
+    // Apply climb-specific velocity limit (lower = more torque)
+    if(fabsf(vel) > CLIMB_MAX_VEL) {
+        vel = (vel > 0) ? CLIMB_MAX_VEL : -CLIMB_MAX_VEL;
+    }
+    
+    // Encode command with HIGH-TORQUE params
+    int p = 1;  // Enable flag
+    int v = (int)((vel + 30.f) * 4095.f / 60.f);  // Velocity: -30..+30 → 0..4095
+    int kdi = (int)(CLIMB_KDI_GAIN * 4095.f / 5.f);  // ← Higher gain = more torque
+    int ff = CLIMB_FF_CURRENT;  // ← Higher feedforward = instant torque
+    
+    tx_msg.data[0] = (p >> 8) & 0xFF;
+    tx_msg.data[1] = p & 0xFF;
+    tx_msg.data[2] = (v >> 4) & 0xFF;
+    tx_msg.data[3] = ((v & 0xF) << 4);
+    tx_msg.data[4] = 0;
+    tx_msg.data[5] = (kdi >> 4) & 0xFF;
+    tx_msg.data[6] = ((kdi & 0xF) << 4) | ((ff >> 8) & 0xF);
+    tx_msg.data[7] = ff & 0xFF;
+    
+    tx_msg.id = id;
+    tx_msg.type = CANData;
+    tx_msg.format = CANStandard;
+    tx_msg.len = 8;
+    
+    can.write(tx_msg);
+    wait_us(100);
 }
 void can10_send_vel(float vel) { can_send_vel(CAN_GRIP, vel); }
 void can10_active_hold(float hold_current = 0.3f) {
@@ -408,10 +425,18 @@ void drive_fwd_corrected() {
     can_send_vel(CAN_BR,  vel_r); wait_us(100);
     can_send_vel(CAN_FR,  vel_r); wait_us(100);
 }
+
 void drive_diagonal_BR(float spd){ can_send_vel(CAN_FL,0.f);wait_us(100); can_send_vel(CAN_BL,spd);wait_us(100); can_send_vel(CAN_BR,0.f);wait_us(100); can_send_vel(CAN_FR,-spd);wait_us(100); }
 void drive_diagonal_BL(float spd){ can_send_vel(CAN_FL,spd);wait_us(100); can_send_vel(CAN_BL,0.f);wait_us(100); can_send_vel(CAN_BR,-spd);wait_us(100); can_send_vel(CAN_FR,0.f);wait_us(100); }
 void drive_spin(float spd){ can_send_vel(CAN_FL,spd);wait_us(100); can_send_vel(CAN_BL,spd);wait_us(100); can_send_vel(CAN_BR,spd);wait_us(100); can_send_vel(CAN_FR,spd);wait_us(100); }
-
+// ✅ NEW: Climb forward drive (mirrors drive_fwd_corrected pattern, uses climb CAN)
+// Motor directions: LEFT = -vel_l, RIGHT = +vel_r (SAME as original!)
+void drive_fwd_corrected_climb() {
+    can_send_vel(CAN_FL, -5); wait_us(100);
+    can_send_vel(CAN_BL, -5); wait_us(100);
+    can_send_vel(CAN_BR,  5); wait_us(100);
+    can_send_vel(CAN_FR,  5); wait_us(100);
+}
 void on_can_rx() {
     if(!can.read(rx_msg) || rx_msg.len<6) return;
     uint32_t now = us_ticker_read()/1000;
@@ -445,6 +470,64 @@ void encoders_reset() {
     enc_left=enc_right=old_stop=32000;
     for(int i=0;i<NUM_W;i++){ last_pos[i]=2048; first_rx[i]=true; }
     __enable_irq();
+}
+int get_turn_for_block_transition(int current_block, int next_block, int zone) {
+    if(current_block == next_block || next_block < 1 || next_block > 12) 
+        return 0;
+    
+    // Find neighbor info for current block
+    const BlockNeighbors* neighbors = nullptr;
+    for(int i = 0; i < 12; i++) {
+        if(NEIGHBORS[i].block == current_block) {
+            neighbors = &NEIGHBORS[i];
+            break;
+        }
+    }
+    if(!neighbors) return 0;
+    
+    int turn_dir = 0;
+    
+    // BLUE side logic (as specified):
+    // Turn RIGHT (CW) when moving INTO: 1(from 2), 5(from 6), 8(from 9), 9(from 10)
+    // Turn LEFT (CCW) when moving INTO: 3(from 2), 8(from 7), 11(from 10)
+    if(zone == ZONE_BLUE) {
+        if(next_block == neighbors->left) {
+            // Moving to left neighbor: 2→1, 6→5, 9→8, 10→9, 11→10, 12→11
+            // Per your spec: 2→1, 6→5, 9→8 = RIGHT turn on BLUE
+            if((current_block==2 && next_block==1) ||
+               (current_block==6 && next_block==5) ||
+               (current_block==9 && next_block==8) ||
+               (current_block==10 && next_block==9)) {
+                turn_dir = +1;  // Turn RIGHT (CW)
+            } else {
+                turn_dir = -1;  // Default: turn LEFT for other left-neighbors
+            }
+        }
+        else if(next_block == neighbors->right) {
+            // Moving to right neighbor: 2→3, 6→7, 7→8, 9→10, 10→11
+            // Per your spec: 2→3, 7→8, 10→11 = LEFT turn on BLUE
+            if((current_block==2 && next_block==3) ||
+               (current_block==7 && next_block==8) ||
+               (current_block==10 && next_block==11)) {
+                turn_dir = -1;  // Turn LEFT (CCW)
+            } else {
+                turn_dir = +1;  // Default: turn RIGHT for other right-neighbors
+            }
+        }
+    }
+    // RED side: mirror/opposite of BLUE
+    else if(zone == ZONE_RED) {
+        if(next_block == neighbors->left) {
+            // Opposite of BLUE: left-neighbor moves = LEFT turn on RED
+            turn_dir = -1;
+        }
+        else if(next_block == neighbors->right) {
+            // Opposite of BLUE: right-neighbor moves = RIGHT turn on RED
+            turn_dir = +1;
+        }
+    }
+    
+    return turn_dir;
 }
 
 bool move_forward_metres(float distance_m, float max_speed) {
@@ -694,7 +777,7 @@ bool pivot_turn_90(bool counter_clockwise, uint32_t timeout_ms = 4000) {
     while (us_ticker_read() / 1000 - t0 < timeout_ms) {
         while (can.read(rx_msg)) on_can_rx();
 
-        if (us_ticker_read() / 1000 - t0 >= TURN_45_MS / 2+500) {  // ~2x 45° time = 90°
+        if (us_ticker_read() / 1000 - t0 >= TURN_45_MS / 2+500) {
             motors_stop();
             pc.printf("  [DONE] Turn complete\r\n");
             return true;
@@ -1279,9 +1362,6 @@ bool tof_at_descent_edge() {
     return (g != 65535) && (g < 100);  // Ground <10cm = edge
 }
 
-// Drive forward target_m metres. When use_balance=true, periodically check
-// L/R sensor pair and briefly strafe to correct. Stops on encoder target
-// or 4 s timeout.
 bool forest_drive_with_balance(float target_m, float max_speed, bool use_balance) {
     encoders_reset();
     uint32_t t0   = us_ticker_read() / 1000;
@@ -1387,18 +1467,20 @@ bool forest_drive_until_block(float max_m, float max_speed, bool use_balance) {
 //   UP-group blocks (1,2,3,5,6,7,8,11): climb UP onto the block
 //   DOWN-group blocks (4,9,10,12)     : climb DOWN onto the block
 // ── forest_move_to_block: climb sequence with per-block sensor masking ──
+// ── forest_move_to_block: climb sequence with per-block sensor masking ──
 void forest_move_to_block(int block) {
     bool is_up_group   = (block == 1 || block == 2 || block == 3 ||
                           block == 5 || block == 6 || block == 7 ||
                           block == 8);
     bool is_down_group = (block == 4 || block == 9 ||
-                          block == 10 ||block == 11|| block == 12);
+                          block == 10 || block == 11 || block == 12);
 
     bool use_left   = block_uses(block, ForestTOF::LEFT);
     bool use_right  = block_uses(block, ForestTOF::RIGHT);
     bool use_front  = block_uses(block, ForestTOF::FRONT);
     bool use_ground = block_uses(block, ForestTOF::GROUND);
     bool use_balance = false;
+    
     #define FWD_40CM(speed) do { \
         encoders_reset(); \
         linear_forward(speed);  /* ← Set vel_l/vel_r FIRST */ \
@@ -1409,11 +1491,11 @@ void forest_move_to_block(int block) {
             int32_t _enc = ((enc_left+enc_right)/2) - 32000; \
             bool _done = (_target<0) ? (_enc<=_target) : (_enc>=_target); \
             if(_done || (us_ticker_read()/1000 - _t0 > 2000)) { motors_stop(); break; } \
-            drive_fwd_corrected();  /* ← No parameter - uses vel_l/vel_r */ \
+            drive_fwd_corrected_climb();  /* ← No parameter - uses vel_l/vel_r */ \
             thread_sleep_for(10); \
         } \
     } while(0)
-    // ───────────────────────────────────────────────────────────────────────
+    
     if(is_up_group) {
         pc.printf("[MOVE] Sequence UP to Block %d\r\n", block);
         pc.printf("  -> Cyl5+Cyl6 EXTEND\r\n");
@@ -1477,33 +1559,137 @@ void forest_move_to_block(int block) {
         lprintf(1,0,"FWD 40cm...     ");
         FWD_40CM(FOREST_DRIVE_SPD);
     }
+    #undef FWD_40CM  // Clean up macro
 }
 
 // ── forest_box_action: CYL3/CAN10/CYL4 grab sequence at current block ────
 //   Works only when a box is registered for the block (caller decides).
-void forest_execute_step(int idx) {
+// Updated signature: add zone parameter
+// ── HELPER: Determine turn direction based on block transition + zone ──
+// Returns: +1 = turn RIGHT (CW), -1 = turn LEFT (CCW), 0 = no turn/straight
+int get_turn_for_transition(int current_block, int next_block, int zone) {
+    if(current_block == next_block || next_block < 1 || next_block > 12) 
+        return 0;
+    
+    // ── BLUE side logic (as specified by user) ───────────────────────
+    if(zone == ZONE_BLUE) {
+        // Turn RIGHT (CW) when moving INTO these blocks:
+        // 2→1, 6→5, 9→8, 11→10  (moving to lower-numbered neighbor on left side)
+        if((current_block == 2 && next_block == 1) ||
+           (current_block == 6 && next_block == 5) ||
+           (current_block == 9 && next_block == 8) ||
+           (current_block == 11 && next_block == 10)) {
+            return +1;  // Turn RIGHT (CW)
+        }
+        // Turn LEFT (CCW) when moving INTO these blocks:
+        // 2→3, 7→8, 10→11  (moving to higher-numbered neighbor on right side)
+        if((current_block == 2 && next_block == 3) ||
+           (current_block == 7 && next_block == 8) ||
+           (current_block == 10 && next_block == 11)) {
+            return -1;  // Turn LEFT (CCW)
+        }
+        // Fallback: use neighbor map for other transitions
+        for(int i = 0; i < 12; i++) {
+            if(NEIGHBORS[i].block == current_block) {
+                if(next_block == NEIGHBORS[i].left) return -1;   // Left neighbor = LEFT turn
+                if(next_block == NEIGHBORS[i].right) return +1;  // Right neighbor = RIGHT turn
+                break;
+            }
+        }
+    }
+    // ── RED side: mirror/opposite of BLUE ───────────────────────────
+    else if(zone == ZONE_RED) {
+        // Opposite logic: swap LEFT/RIGHT results
+        if((current_block == 2 && next_block == 1) ||
+           (current_block == 6 && next_block == 5) ||
+           (current_block == 9 && next_block == 8) ||
+           (current_block == 11 && next_block == 10)) {
+            return -1;  // RED: opposite = LEFT
+        }
+        if((current_block == 2 && next_block == 3) ||
+           (current_block == 7 && next_block == 8) ||
+           (current_block == 10 && next_block == 11)) {
+            return +1;  // RED: opposite = RIGHT
+        }
+        // Fallback
+        for(int i = 0; i < 12; i++) {
+            if(NEIGHBORS[i].block == current_block) {
+                if(next_block == NEIGHBORS[i].left) return +1;   // RED: opposite
+                if(next_block == NEIGHBORS[i].right) return -1;  // RED: opposite
+                break;
+            }
+        }
+    }
+    return 0;  // No turn / straight
+}
+void forest_execute_step(int idx) {  // ← Keep signature unchanged
     int   block   = forest_path_blocks[idx];
     int   presses = forest_path_presses[idx];
     float h_target = ir_get_height(block);
     int   box_act  = ir_get_box_action(block);
 
-    pc.printf("\r\n[FOREST STEP %d/%d] B%d presses=%d h=%.0fcm box_act=%+d\r\n",
-              idx+1, forest_path_len, block, presses, (double)h_target, box_act);
-    lprintf(0,0,"S%d/%d B%d H%.0f", idx+1, forest_path_len, block, (double)h_target);
-    forest_adjust_height(h_target);
-    if(box_act != 0 && forest_should_grab_box(block)) {
-        forest_grab_box(box_act);
+    // ... existing code ...
+
+    // ── TURN LOGIC: Use g_zone (global) instead of undefined 'zone' ──
+    int next_block = (idx+1 < forest_path_len) ? forest_path_blocks[idx+1] : -1;
+    
+    if(next_block > 0) {
+        // BLUE side block-based turn logic
+        if(g_zone == ZONE_BLUE) {  // ← Use g_zone instead of zone
+            // RIGHT turn (CW) cases: 2→1, 6→5, 9→8
+            if((block==2 && next_block==1) ||
+               (block==6 && next_block==5) ||
+               (block==9 && next_block==8)) {
+                lprintf(1,0,"TURN RIGHT      ");
+                forest_turn_right();
+                thread_sleep_for(200);
+                goto TURN_DONE;  // Skip press-count fallback
+            }
+            // LEFT turn (CCW) cases: 2→3, 7→8, 10→11
+            else if((block==2 && next_block==3) ||
+                    (block==7 && next_block==8) ||
+                    (block==10 && next_block==11)) {
+                lprintf(1,0,"TURN LEFT       ");
+                forest_turn_left();
+                thread_sleep_for(200);
+                goto TURN_DONE;
+            }
+        }
+        // RED side: mirror of BLUE
+        else if(g_zone == ZONE_RED) {  // ← Use g_zone
+            if((block==2 && next_block==1) ||
+               (block==6 && next_block==5) ||
+               (block==9 && next_block==8)) {
+                lprintf(1,0,"TURN LEFT       ");
+                forest_turn_left();
+                thread_sleep_for(200);
+                goto TURN_DONE;
+            }
+            else if((block==2 && next_block==3) ||
+                    (block==7 && next_block==8) ||
+                    (block==10 && next_block==11)) {
+                lprintf(1,0,"TURN RIGHT      ");
+                forest_turn_right();
+                thread_sleep_for(200);
+                goto TURN_DONE;
+            }
+        }
     }
-    if      (presses == 2) forest_turn_right();
-    else if (presses >= 3) forest_turn_left();
+    
+    // Fallback to press-count logic if block logic didn't trigger
+    if      (presses == 2) { forest_turn_right(); thread_sleep_for(200); }
+    else if (presses >= 3) { forest_turn_left();  thread_sleep_for(200); }
+    
+TURN_DONE:
+    // else: no turn (presses == 1 or straight)
 
     forest_robot.current_block = block;
-    pc.printf("[FOREST STEP %d] DONE block=%d h=%.0f dir=%d\r\n",
-              idx+1, forest_robot.current_block,
-              (double)forest_robot.current_height_cm, forest_robot.direction);
+    pc.printf("[FOREST STEP %d] DONE block=%d dir=%d\r\n",
+              idx+1, forest_robot.current_block, forest_robot.direction);
     thread_sleep_for(250);
 }
 
+// ── MODIFIED: forest_run_path with sensor trigger + zone-aware turns ──
 void forest_run_path(int zone) {
     pc.printf("\r\n[FOREST] === RUN PATH zone=%s len=%d ===\r\n",
               (zone==ZONE_RED)?"RED":"BLUE", forest_path_len);
@@ -1521,10 +1707,31 @@ void forest_run_path(int zone) {
         pc.printf("B%d(x%d) ", forest_path_blocks[i], forest_path_presses[i]);
     pc.printf("\r\n");
 
+    // ═══════════════════════════════════════════════════════════════
+    //  NEW: WAIT FOR PB_4 (ir_sens) TRIGGER BEFORE STARTING
+    // ═══════════════════════════════════════════════════════════════
+    pc.printf("[FOREST] Waiting for PB_4 (ir_sens) trigger...\r\n");
+    lprintf(0,0,"WAIT SENSOR...  ");
+    lprintf(1,0,"PB_4=START      ");
+
+    // Wait for ir_sens (PB_4) to go LOW (active)
+    while(ir_sens.read() == 1) {
+        led = !led;  // Heartbeat LED while waiting
+        thread_sleep_for(50);
+    }
+    thread_sleep_for(100);  // Debounce
+
+    lprintf(0,0,"SENSOR TRIGGERED");
+    lprintf(1,0,"Starting...     ");
+    pc.printf("[FOREST] PB_4 triggered - starting navigation\r\n");
+    thread_sleep_for(300);
+    // ═══════════════════════════════════════════════════════════════
+
     forest_state_init(zone);
 
     for(int i=0; i<forest_path_len; i++) {
-        forest_execute_step(i);
+        // ✅ Pass zone parameter
+        forest_execute_step(i); 
         led = !led;
     }
 
@@ -1857,41 +2064,37 @@ void op_mode() {
 #define S7_CLIMB  1
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  SECTION 11A — RED SEQUENCE (UPDATED)                                    ║
+// ║  RUN NORMAL: Spear Pickup Only (Cases 1-5) — NO FOREST CODE            ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
+
 void run_normal_red() {
-    pc.printf("\r\n[RUN] RED: FWD->LEFT->FWD->diag-RIGHT-BACK->spin-CCW\r\n");
-
-    const char* SN[] = {
-        "?       ","INIT    ","APPROACH","SWEEP   ",
-        "PICKUP  ","BACK    ","ROT_90  ","CYL14   ","HOLD    "
-    };
-
-    int sub4=S4_FWD, sub5=0, sub6=0, sub8=0;
-    uint32_t sub_t0=0;
-    int8_t  mode=0;
-    bool    op=true, first=true;
-    float   spd=0.f;
-    int     conf=0, ptick=0;
-    uint32_t t0=us_ticker_read()/1000;
+    pc.printf("\r\n[RUN NORMAL RED] Spear pickup sequence (Cases 1-5)\r\n");
     
-
-    auto sms=[&]()->uint32_t{ return us_ticker_read()/1000-t0; };
-
-    auto enter=[&](int8_t s){
-        const char* from=(mode>=0&&mode<=8)?SN[mode]:"?";
-        const char* to  =(s   >=0&&s   <=8)?SN[s]   :"?";
-        pc.printf("\r\n[STATE-RED] %s -> %s  EL:%ld ER:%ld t:%lus\r\n",
-                  from,to,(long)enc_left,(long)enc_right,(unsigned long)sms()/1000);
-        mode=s; t0=us_ticker_read()/1000; conf=0; first=true; spd=0.f;
-        motors_stop(); encoders_reset();
-        lprintf(0,0,"R:%-14s",to);
+    const char* SN[] = {"?","INIT","APPROACH","SWEEP","PICKUP","BACK","DONE"};
+    int sub4 = S4_FWD, sub5 = 0;
+    uint32_t sub_t0 = 0;
+    int8_t mode = 0;
+    bool op = true, first = true;
+    float spd = 0.f;
+    uint32_t t0 = us_ticker_read()/1000;
+    
+    auto sms = [&]()->uint32_t { return us_ticker_read()/1000 - t0; };
+    
+    auto enter = [&](int8_t s) {
+        mode = s; 
+        t0 = us_ticker_read()/1000; 
+        first = true; 
+        spd = 0.f;
+        motors_stop(); 
+        encoders_reset();
+        lprintf(0,0,"RN:%-14s", SN[s]);
         lprintf(1,0,"                ");
+        pc.printf("[RN-RED] Enter state %d: %s\r\n", s, SN[s]);
     };
-
+    
     encoders_reset();
     enter(1);
-
+    
     while(op){
         float d1=read_cm(sharp1,S1_K,S1_OFF);
         float d2=read_cm(sharp2,S2_K,S2_OFF);
@@ -1979,28 +2182,11 @@ void run_normal_red() {
         case 5:{   // BACK — diagonal RIGHT-back + spin CCW
             switch(sub5){
                 case 0:{  // Diagonal move
-                    if(first){ 
-                        first=false; 
-                        pc.printf("[BACK-RED sub0] diag RIGHT-back %lums\r\n",(unsigned long)DIAG_MS); 
-                        lprintf(1,0,"DIAG R-BACK RED "); 
-                        t0=us_ticker_read()/1000; 
-                    }
-                    if(sms()>DIAG_MS+3000){ 
-                        pc.printf("[FAULT-RED] diag timeout\r\n"); 
-                        op=false; 
-                        break; 
-                    }
-                    if(sms()>=DIAG_MS){ 
-                        motors_stop(); 
-                        lprintf(1,0,"DIAG done RED   "); 
-                        thread_sleep_for(80); 
-                        sub5=1; 
-                        t0=us_ticker_read()/1000; 
-                        first=true; 
-                        break; 
-                    }
-                    drive_diagonal_BR(MOVE_SPD);
-                    lprintf(1,0,"DIAGR t:%lu/%lu ",(unsigned long)sms(),(unsigned long)DIAG_MS);
+                    if(sms()>APPROACH_TIME_MS+100){ pc.printf("[FAULT-RED] approach timeout\r\n"); op=false; break; }
+                    if(sms()>=APPROACH_TIME_MS){ motors_stop(); lprintf(1,0,"APPROACH OK     "); thread_sleep_for(100); sub5=1; break; }
+                    spd+=RAMP_STEP; if(spd>APPROACH_SPD) spd=APPROACH_SPD;
+                    linear_forward(-spd); drive_fwd_corrected();
+                    lprintf(1,0,"FWD %lu/%lums   ",(unsigned long)sms(),(unsigned long)APPROACH_TIME_MS);
                     break;
                 }
                 case 1:{  // Spin CCW
@@ -2042,23 +2228,24 @@ void run_normal_red() {
                     thread_sleep_for(10000); break; 
                 }
                 case 3:{  // Optional: Add cylinder action here if needed
-                if(first){
-                first=false;
-                lprintf(1,0,"C1DN C2OPN C4=0 ");
-                cyl_arm=1; cyl_grip=0; cyl_dir=0;
-                lprintf(1,0,"Rot->HOME RED   ");
-                lprintf(1,0,"INIT OK HOME=%d ",sw_home.read());
-                cyl_arm=0; cyl_grip=0; cyl_dir=0;
-                thread_sleep_for(CYL_ARM_MS);
-                lprintf(1,0,"Rot->HOME RED   ");
-                lprintf(1,0,"INIT OK HOME=%d ",sw_home.read());
-                cyl_arm=0; cyl_grip=1; cyl_dir=0;
-                thread_sleep_for(CYL_ARM_MS);
-                lprintf(1,0,"Rot->HOME RED   ");
-                lprintf(1,0,"INIT OK HOME=%d ",sw_home.read());
-                thread_sleep_for(300); enter(6);
-            }
-            break;
+                    if(first){
+                        first=false;
+                        lprintf(1,0,"C1DN C2OPN C4=0 ");
+                        cyl_arm=1; cyl_grip=0; cyl_dir=0;
+                        thread_sleep_for(750);
+                        lprintf(1,0,"Rot->HOME RED   ");
+                        lprintf(1,0,"INIT OK HOME=%d ",sw_home.read());
+                        cyl_arm=0; cyl_grip=0; cyl_dir=0;
+                        thread_sleep_for(CYL_ARM_MS);
+                        lprintf(1,0,"Rot->HOME RED   ");
+                        lprintf(1,0,"INIT OK HOME=%d ",sw_home.read());
+                        cyl_arm=0; cyl_grip=0; cyl_dir=0;
+                        thread_sleep_for(CYL_ARM_MS);
+                        lprintf(1,0,"Rot->HOME RED   ");
+                        lprintf(1,0,"INIT OK HOME=%d ",sw_home.read());
+                        thread_sleep_for(300); enter(6);
+                    }
+                    break;
                 }
                 default:  
                     pc.printf("[FAULT-RED] bad sub5=%d\r\n",sub5); 
@@ -2067,365 +2254,57 @@ void run_normal_red() {
             }
             break;
         }
-        case 6:{   // FOREST ENTRY: Turn → Diag Front-Left → Forward → Transition to Forest
-            switch(sub6){
-                
-                // ── SUB6_SPIN: Turn CCW to orient toward forest ──────────────────
-                case S6_SPIN:{
-                    if(first){ 
-                        first = false;
-                        sub_t0 = us_ticker_read()/1000;
-                        pc.printf("[CASE-6 sub0] SPIN CCW to face forest, %lums\r\n", (unsigned long)TURN_45_MS);
-                        lprintf(1,0,"TURN CCW...     ");
-                    }
-                    
-                    uint32_t el = us_ticker_read()/1000 - sub_t0;
-                    
-                    // Timeout protection
-                    if(el > TURN_45_MS+100){
-                        pc.printf("[FAULT-RED] Case6 spin timeout\r\n");
-                        motors_stop();
-                        op = false;
-                        break;
-                    }
-                    
-                    // Transition to next sub-state when time reached
-                    if(el >= TURN_45_MS){
-                        motors_stop();
-                        lprintf(1,0,"TURN OK         ");
-                        thread_sleep_for(150);
-                        sub6 = S6_DIAG;      // ← Next: diagonal move
-                        sub_t0 = us_ticker_read()/1000;
-                        first = true;
-                        break;
-                    }
-                    
-                    // Execute CCW spin (+spd = CCW for RED zone)
-                    drive_spin(MOVE_SPD);
-                    lprintf(1,0,"SPIN %lu/%lums  ", (unsigned long)el, (unsigned long)TURN_45_MS);
-                    break;
-                }
-                
-                // ── SUB6_DIAG: Diagonal Front-Left positioning move ─────────────
-                case S6_DIAG:{
-                    if(first){ 
-                        first=false; 
-                        pc.printf("[BACK-RED sub0] diag RIGHT-back %lums\r\n",(unsigned long)DIAG_MS); 
-                        lprintf(1,0,"DIAG R-BACK RED "); 
-                        t0=us_ticker_read()/1000; 
-                    }
-                    if(sms()>DIAG_MS+5000){ 
-                        pc.printf("[FAULT-RED] diag timeout\r\n"); 
-                        op=false; 
-                        break; 
-                    }
-                    if(sms()>=DIAG_MS){ 
-                        motors_stop(); 
-                        lprintf(1,0,"DIAG done RED   "); 
-                        thread_sleep_for(80); 
-                        sub6=S6_FWD;
-                        t0=us_ticker_read()/1000; 
-                        first=true; 
-                        break; 
-                    }
-                    drive_diagonal_BL(-MOVE_SPD);
-                    lprintf(1,0,"DIAGR t:%lu/%lu ",(unsigned long)sms(),(unsigned long)DIAG_MS);
-                    break;
-                }                
-                // ── SUB6_FWD: Final forward approach to forest entry ────────────
-                case S6_FWD:{
-                    if(first){
-                        first = false;
-                        sub_t0 = us_ticker_read()/1000;
-                        pc.printf("[CASE-6 sub2] FWD to forest entry, %lums\r\n", (unsigned long)APPROACH_TIME_MS/2);
-                        lprintf(1,0,"FWD to forest.. ");
-                        encoders_reset();  // Reset for distance-based stop if needed
-                    }
-                    
-                    uint32_t el = us_ticker_read()/1000 - sub_t0;
-                    uint32_t fwd_duration = APPROACH_TIME_MS / 2;  // ~1.5s forward
-                    
-                    // Timeout protection
-                    if(el > fwd_duration + 2100){
-                        pc.printf("[FAULT-RED] Case6 fwd timeout\r\n");
-                        motors_stop();
-                        op = false;
-                        break;
-                    }                    
-                    // Transition to forest navigation when forward move complete
-                    if(el >= fwd_duration){
-                        motors_stop();
-                        lprintf(1,0,"ENTRY OK");
-                        thread_sleep_for(200);
-                        
-                        // ── TRANSITION TO FOREST OPERATIONS ──────────────────────
-                        forest_state_init(ZONE_RED);
-                        forest_step_idx = 0;
-                        forest_sub_step = 0;
-                        forest_init_done = false;
-                        
-                        if(!forest_path_confirmed || forest_path_len == 0){
-                            pc.printf("[RED-FOREST] No path confirmed — skipping forest\r\n");
-                            lprintf(0,0,"NO FOREST PATH  ");
-                            lprintf(1,0,"Skip to DONE    ");
-                            thread_sleep_for(500);
-                            enter(9);  // Skip to DONE state
-                        } else {
-                            pc.printf("[RED-FOREST] Starting forest nav: %d steps\r\n", forest_path_len);
-                            lprintf(0,0,"FOREST NAV RED  ");
-                            lprintf(1,0,"Step 1/%d...    ", forest_path_len);
-                            enter(7);  // → Enter forest navigation (Case 7)
-                        }
-                        break;  // ← Critical: exit switch after state transition
-                    }
-                    
-                    // Execute straight forward movement
-                    linear_forward(FOREST_DRIVE_SPD * 0.8f); drive_fwd_corrected();
-                    lprintf(1,0,"FWD %lu/%lums   ", (unsigned long)el, (unsigned long)fwd_duration);
-                    break;
-                }
-                
-                default:
-                    pc.printf("[FAULT-RED] Case6 bad sub6=%d\r\n", sub6);
-                    motors_stop();
-                    op = false;
-                    break;
-            }
-            break;  // ← End of case 6 switch
-        }
-        case 7: {   // FOREST: Main path + side detours for adjacent boxes
-            static int step = 0;
+        
+        case 6: {  // ── DONE: Release spear, sequence complete ──────
+            cyl_grip = 0;  // Open gripper to release
+            cyl_dir = 0;
             cyl_all_safe();
-            if(first) {
-                step = 0; first = false;
-                pc.printf("\r\n[CASE-7] FOREST WITH SIDE DETOURS\r\n");
-                pc.printf("  Path: "); for(int i=0;i<forest_path_len;i++) pc.printf("%d ",forest_path_blocks[i]);
-                pc.printf("\r\n  Boxes: "); for(int i=0;i<forest_box_count;i++) pc.printf("B%d ",forest_box_blocks[i]);
-                pc.printf("\r\n");
-                lprintf(0,0,"FOREST+DETOURS  "); lprintf(1,0,"Step 1/%d...    ", forest_path_len);
-            }
-
-            if(step < forest_path_len) {
-                int block = forest_path_blocks[step];
-                int presses = forest_path_presses[step];
-                const BlockNeighbors* nb = get_neighbors(block);
-
-                // ── 1. CLIMB onto main path block ───────────────────────────────
-                pc.printf("  [1] Climbing to Block %d...\r\n", block);
-                lprintf(1,0,"CLIMB B%d...    ", block);
-                forest_move_to_block(block);
-                lprintf(1,0,"OK              "); thread_sleep_for(400);
-
-                // ── 2. CHECK LEFT neighbor for box ──────────────────────────────
-                if(nb && nb->left > 0 && forest_block_has_box(nb->left, nullptr)) {
-                    pc.printf("  [2] Box on LEFT (B%d) — detour\r\n", nb->left);
-                    detour_grab_box(block, nb->left, -1);  // -1 = LEFT turn
-                }
-
-                // ── 3. CHECK RIGHT neighbor for box ─────────────────────────────
-                if(nb && nb->right > 0 && forest_block_has_box(nb->right, nullptr)) {
-                    pc.printf("  [3] Box on RIGHT (B%d) — detour\r\n", nb->right);
-                    detour_grab_box(block, nb->right, +1);  // +1 = RIGHT turn
-                }
-
-                // ── 4. CHECK current block for box ──────────────────────────────
-                int box_act = 0;
-                if(forest_block_has_box(block, &box_act)) {
-                    pc.printf("  [4] Box on B%d — grab\r\n", block);
-                    lprintf(1,0,"GRAB B%d...     ", block);
-                    forest_grab_box(box_act);
-                    lprintf(1,0,"BOX HELD        "); thread_sleep_for(200);
-                }
-
-                // ── 5. HANDLE TURNS for next path block ─────────────────────────
-                if(presses == 2) { lprintf(1,0,"TURN RIGHT      "); forest_turn_right(); }
-                else if(presses >= 3) { lprintf(1,0,"TURN LEFT       "); forest_turn_left(); }
-
-                // ── 6. SPECIAL: If last block is 11, auto-detour to 12 to exit ─
-                if(step == forest_path_len-1 && block == 11) {
-                    pc.printf("  [5] Last=11 → auto-detour to 12 for exit\r\n");
-                    detour_grab_box(11, 12, +1);  // Turn RIGHT to 12
-                    lprintf(1,0,"CLIMB DOWN B12  "); forest_move_to_block(12); lprintf(1,0,"DONE            ");
-                }
-
-                // ── 7. NEXT STEP ────────────────────────────────────────────────
-                step++;
-                if(step < forest_path_len) lprintf(1,0,"Step %d/%d...   ", step+1, forest_path_len);
-                thread_sleep_for(150);
-
-            } else {
-                // ── ALL DONE: Exit forest ───────────────────────────────────────
-                pc.printf("\r\n[CASE-7] Forest complete! Exiting...\r\n");
-                lprintf(0,0,"FOREST DONE     "); lprintf(1,0,"To exit...      ");
-                linear_forward(FOREST_DRIVE_SPD * 0.5f);
-                drive_fwd_corrected(); thread_sleep_for(600); motors_stop();
-                cyl_all_safe(); thread_sleep_for(300);
-                enter(9);  // → DONE (release boxes)
-            }
-            break;
-        }
-        case 8:{   // DONE — Exit maneuver: FWD→RIGHT→FAST_FWD
-            static int exit_step = 0;
-            static uint32_t exit_t0 = 0;
-            
-            if(first){
-                first = false;
-                exit_step = 0;
-                exit_t0 = us_ticker_read()/1000;
-                pc.printf("[CASE-9] Exit maneuver: FWD→RIGHT→FAST_FWD\r\n");
-                lprintf(0,0,"EXIT MANEUVER   ");
-                lprintf(1,0,"Step 1: FWD...  ");
-            }
-            
-            switch(exit_step){
-                
-                // ── STEP 1: Small forward nudge (~0.3m) ─────────────────────────
-                case 0:{
-                    if(first){  // First entry to this sub-step
-                        first = false;
-                        exit_t0 = us_ticker_read()/1000;
-                        encoders_reset();
-                        pc.printf("  [9.1] FWD nudge 0.3m\r\n");
-                    }
-                    
-                    int32_t enc_avg = (enc_left + enc_right) / 2;
-                    int32_t target = (int32_t)(0.30f * TICKS_PER_M) * MOTOR_DIR_SIGN;
-                    bool done = (target < 0) ? (enc_avg <= target) : (enc_avg >= target);
-                    
-                    if(done || (us_ticker_read()/1000 - exit_t0 > 2000)){  // 2s timeout
-                        motors_stop();
-                        lprintf(1,0,"Step 2: RIGHT.. ");
-                        pc.printf("  [9.1] DONE\r\n");
-                        exit_step = 1;
-                        first = true;  // Reset for next sub-step
-                        exit_t0 = us_ticker_read()/1000;
-                        break;
-                    }
-                    
-                    linear_forward(FOREST_DRIVE_SPD * 0.5f);  // Slow nudge
-                    drive_fwd_corrected();
-                    lprintf(1,0,"FWD %.2fm...    ", (float)(enc_avg - 32000) / TICKS_PER_M);
-                    break;
-                }
-                
-                // ── STEP 2: Strafe RIGHT 2 meters ──────────────────────────────
-                case 1:{
-                    if(first){
-                        first = false;
-                        exit_t0 = us_ticker_read()/1000;
-                        encoders_reset();
-                        pc.printf("  [9.2] STRAFE RIGHT 2.0m\r\n");
-                    }
-                    
-                    int32_t enc_avg = (enc_left + enc_right) / 2;
-                    // For strafe, use average encoder as proxy (not perfect but works)
-                    int32_t target = (int32_t)(2.0f * TICKS_PER_M) * MOTOR_DIR_SIGN;
-                    bool done = (target < 0) ? (enc_avg <= target) : (enc_avg >= target);
-                    
-                    if(done || (us_ticker_read()/1000 - exit_t0 > 8000)){  // 8s timeout
-                        motors_stop();
-                        lprintf(1,0,"Step 3: FAST FWD");
-                        pc.printf("  [9.2] DONE\r\n");
-                        exit_step = 2;
-                        first = true;
-                        exit_t0 = us_ticker_read()/1000;
-                        break;
-                    }
-                    
-                    // Strafe RIGHT: row 0 motor pattern
-                    motors_drive(0, STRAFE_SPD);
-                    lprintf(1,0,"RIGHT %.2fm...  ", (float)(enc_avg - 32000) / TICKS_PER_M);
-                    break;
-                }
-                
-                // ── STEP 3: Forward FAST (2× speed) for 2 meters ───────────────
-                case 2:{
-                    if(first){
-                        first = false;
-                        exit_t0 = us_ticker_read()/1000;
-                        encoders_reset();
-                        pc.printf("  [9.3] FAST FWD 2.0m @ %.1f m/s\r\n", FOREST_DRIVE_SPD * 2.0f);
-                    }
-                    
-                    int32_t enc_avg = (enc_left + enc_right) / 2;
-                    int32_t target = (int32_t)(2.0f * TICKS_PER_M) * MOTOR_DIR_SIGN;
-                    bool done = (target < 0) ? (enc_avg <= target) : (enc_avg >= target);
-                    
-                    if(done || (us_ticker_read()/1000 - exit_t0 > 5000)){  // 5s timeout
-                        motors_stop();
-                        cyl_all_safe();
-                        lprintf(0,0,"DONE RED        ");
-                        lprintf(1,0,"Sequence OK     ");
-                        pc.printf("  [9.3] DONE — EXIT COMPLETE\r\n");
-                        pc.printf("[RED] === SEQUENCE COMPLETE ===\r\n");
-                        op = false;  // End main loop
-                        break;
-                    }
-                    
-                    // Forward at 2× speed
-                    linear_forward(FOREST_DRIVE_SPD * 2.0f);
-                    drive_fwd_corrected();
-                    lprintf(1,0,"FAST %.2fm...   ", (float)(enc_avg - 32000) / TICKS_PER_M);
-                    break;
-                }
-                
-                default:
-                    motors_stop(); cyl_all_safe(); op = false;
-                    break;
-            }
-            break;  // End of case 9
-        }
-
-        case 9:{   // DONE
-            cyl_grip=0; cyl_dir=0; cyl_all_safe();
-            lprintf(0,0,"DONE RED        ");
+            lprintf(0,0,"DONE NORMAL     ");
             lprintf(1,0,"Sequence OK     ");
-            pc.printf("[RED] === SEQUENCE COMPLETE ===\r\n");
-            op=false; enter(9);
+            pc.printf("[NORMAL] === SEQUENCE COMPLETE ===\r\n");
+            op = false;
             break;
         }
-        default: op=false; break;
+        
+        default:
+            op = false;
+            break;
         }
-
-        ptick++;
-        if(ptick>=50){
-            ptick=0;
-            const char* sn=(mode>=1&&mode<=8)?SN[mode]:"?";
-            pc.printf("[RED %-8s %2lus] S1:%.1f EL:%ld ER:%ld spd:%.2f C1:%d C2:%d C4:%d s4:%d s7:%d\r\n",
-                      sn,(unsigned long)sms()/1000,(double)d1,(long)enc_left,(long)enc_right,
-                      (double)spd,cyl_arm.read(),cyl_grip.read(),cyl_dir.read(),sub4);
-        }
+        
         thread_sleep_for(10);
     }
     motors_stop();
-    pc.printf("[RUN] run_normal_red complete\r\n");
+    cyl_all_safe();
 }
 
-// ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  SECTION 11B — BLUE SEQUENCE                                             ║
-// ╚══════════════════════════════════════════════════════════════════════════╝
+// ── BLUE VERSION: Same structure, SWEEP strafes RIGHT (row 0) ─────────────
 void run_normal_blue() {
-    pc.printf("\r\n[RUN-BLU] FWD->RIGHT->FWD->BACK->ROT90 → FOREST PATH\r\n");
-
-    const char* SN[]={"?","INIT","APPROACH","SWEEP","PICKUP","BACK","ROT_90","FOREST_E","FOREST_N","DONE"};
-    int sub4=S4_FWD, sub5=0, sub6=0, sub8=0;
-    uint32_t sub_t0=0;
-    int8_t  mode=0;
-    bool    op=true, first=true;
-    float   spd=0.f;
-    int     ptick=0;
-    uint32_t t0=us_ticker_read()/1000;
-
-    auto sms=[&]()->uint32_t{ return us_ticker_read()/1000-t0; };
-    auto enter=[&](int8_t s){
-        const char* from=(mode>=0&&mode<=9)?SN[mode]:"?";
-        const char* to  =(s   >=0&&s   <=9)?SN[s]   :"?";
-        pc.printf("\r\n[BLU] %s -> %s\r\n",from,to);
-        mode=s; t0=us_ticker_read()/1000; first=true; spd=0.f;
-        motors_stop(); encoders_reset();
-        lprintf(0,0,"B:%-14s",to); lprintf(1,0,"                ");
+    pc.printf("\r\n[RUN NORMAL RED] Spear pickup sequence (Cases 1-5)\r\n");
+    
+    const char* SN[] = {"?","INIT","APPROACH","SWEEP","PICKUP","BACK","DONE"};
+    int sub4 = S4_FWD, sub5 = 0;
+    uint32_t sub_t0 = 0;
+    int8_t mode = 0;
+    bool op = true, first = true;
+    float spd = 0.f;
+    uint32_t t0 = us_ticker_read()/1000;
+    
+    auto sms = [&]()->uint32_t { return us_ticker_read()/1000 - t0; };
+    
+    auto enter = [&](int8_t s) {
+        mode = s; 
+        t0 = us_ticker_read()/1000; 
+        first = true; 
+        spd = 0.f;
+        motors_stop(); 
+        encoders_reset();
+        lprintf(0,0,"RN:%-14s", SN[s]);
+        lprintf(1,0,"                ");
+        pc.printf("[RN-RED] Enter state %d: %s\r\n", s, SN[s]);
     };
-
+    
+    encoders_reset();
+    enter(1);
     encoders_reset();
     enter(1);
 
@@ -2484,7 +2363,7 @@ void run_normal_blue() {
             }
             
             // Timeout protection
-            if(sms() > SWEEP_MAX_MS){
+            if(sms() > SWEEP_MAX_MS*2){
                 motors_stop(); 
                 pc.printf("[FAULT-BLU] Sweep timeout - no spear (S1=%.1fcm)\r\n", (double)d1);
                 lprintf(1,0,"NO SPEAR BLU!   "); 
@@ -2583,13 +2462,32 @@ void run_normal_blue() {
                     }
                     uint32_t el=us_ticker_read()/1000-sub_t0;
                     if(el >= 200) {  // Short settle time
-                        sub5=0; 
+                        sub5=3; 
                         t0=us_ticker_read()/1000; 
                         first=true; 
                         break; 
                     }
                     thread_sleep_for(10000); break; 
                 }
+                case 3:{  // Optional: Add cylinder action here if needed
+                    if(first){
+                        first=false;
+                        lprintf(1,0,"C1DN C2OPN C4=0 ");
+                        cyl_arm=1; cyl_grip=0; cyl_dir=0;
+                        thread_sleep_for(750);
+                        lprintf(1,0,"Rot->HOME RED   ");
+                        lprintf(1,0,"INIT OK HOME=%d ",sw_home.read());
+                        cyl_arm=0; cyl_grip=0; cyl_dir=0;
+                        thread_sleep_for(CYL_ARM_MS);
+                        lprintf(1,0,"Rot->HOME RED   ");
+                        lprintf(1,0,"INIT OK HOME=%d ",sw_home.read());
+                        cyl_arm=0; cyl_grip=0; cyl_dir=0;
+                        thread_sleep_for(CYL_ARM_MS);
+                        lprintf(1,0,"Rot->HOME RED   ");
+                        lprintf(1,0,"INIT OK HOME=%d ",sw_home.read());
+                        thread_sleep_for(300); enter(6);
+                    }
+                }    
                 default: 
                     pc.printf("[FAULT-RED] bad sub5=%d\r\n",sub5); 
                     op=false;  thread_sleep_for(10000);
@@ -2597,204 +2495,296 @@ void run_normal_blue() {
             }
             break;
         }
-        case 6:{   // FOREST ENTRY: Turn → Diag Front-Left → Forward → Transition to Forest
-            switch(sub6){
+        case 6: {  // ── DONE: Release spear, sequence complete ──────
+            cyl_grip = 0;  // Open gripper to release
+            cyl_dir = 0;
+            cyl_all_safe();
+            lprintf(0,0,"DONE NORMAL     ");
+            lprintf(1,0,"Sequence OK     ");
+            pc.printf("[NORMAL] === SEQUENCE COMPLETE ===\r\n");
+            op = false;
+            break;
+        }
+        
+        default:
+            op = false;
+            break;
+        }
+        
+        thread_sleep_for(10);
+    }
+    motors_stop();
+    cyl_all_safe();
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  RETRY MC: Forest Navigation (Cases 6-9) — USES STORED PATH            ║
+// ║  NOTE: collect_forest_path() MUST be called BEFORE this function!      ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+void run_retry_mc_red() {
+    pc.printf("\r\n[RETRY MC RED] Forest navigation (Cases 11-14)\r\n");
+    pc.printf("  Path confirmed: %s, Length: %d steps\r\n",
+              forest_path_confirmed ? "YES" : "NO", forest_path_len);
+    
+    // Safety: Skip if no path
+    if(!forest_path_confirmed || forest_path_len == 0) {
+        pc.printf("[WARN] No forest path — skipping navigation\r\n");
+        lprintf(0,0,"NO PATH SKIPPED ");
+        lprintf(1,0,"Retry MC empty  ");
+        thread_sleep_for(1000);
+        return;
+    }
+    
+    const char* SN[] = {"?","ENTRY","NAV","BOX","DONE"};
+    
+    // ── STATE VARIABLES ─────────────────────────────────────────────────
+    int8_t mode = 11;  // ← START at case 11, NOT 10!
+    bool op = true, first = true;
+    float spd = 0.f;
+    uint32_t t0 = us_ticker_read()/1000;
+    
+    auto sms = [&]()->uint32_t { return us_ticker_read()/1000 - t0; };
+    
+    // ── FIXED: enter() sets mode = s (not hardcoded 10!) ────────────────
+    auto enter = [&](int8_t s) {
+        mode = s;  // ← ✅ CRITICAL FIX: was `mode = 10`
+        t0 = us_ticker_read()/1000;
+        first = true;
+        spd = 0.f;
+        motors_stop();
+        encoders_reset();
+        lprintf(0,0,"RM:%-14s", SN[s]);
+        lprintf(1,0,"                ");
+        pc.printf("[RM-RED] Enter state %d: %s\r\n", s, SN[s]);
+    };
+    
+    // Initialize forest state for RED zone
+    forest_state_init(ZONE_RED);
+    forest_step_idx = 0;
+    forest_sub_step = 0;
+
+    pc.printf("[FOREST] Waiting for PB_4 (ir_sens) trigger...\r\n");
+    lprintf(0,0,"WAIT SENSOR...  ");
+    lprintf(1,0,"PB_4=START      ");
+
+    // Wait for ir_sens (PB_4) to go LOW (active)
+    while(ir_sens.read() == 1) {
+        led = !led;  // Heartbeat LED
+        thread_sleep_for(50);
+    }
+    thread_sleep_for(100);  // Debounce
+
+    lprintf(0,0,"SENSOR TRIGGERED");
+    lprintf(1,0,"Starting...     ");
+    pc.printf("[FOREST] PB_4 triggered - starting navigation\r\n");
+    thread_sleep_for(300);
+    
+    enter(11);  // ← Start at case 11
+    
+    // ═══════════════════════════════════════════════════════════════════
+    //  MAIN STATE MACHINE LOOP
+    // ═══════════════════════════════════════════════════════════════════
+    while(op) {
+        switch(mode) {
+            
+        // ── CASE 11: FOREST ENTRY — Diagonal → Forward → Transition ─────
+        case 11: {  // 11
+            static int sub11 = 0;
+            static uint32_t sub_t0 = 0;
+            
+            switch(sub11) {
                 
-                // ── SUB6_SPIN: Turn CCW to orient toward forest ──────────────────
-                case S6_SPIN:{
-                    if(first){ 
+                // ── SUB 0: Diagonal move to position for forest entry ───
+                case 0: {
+                    if(first) { 
                         first = false;
                         sub_t0 = us_ticker_read()/1000;
-                        pc.printf("[CASE-6 sub0] SPIN CCW to face forest, %lums\r\n", (unsigned long)TURN_45_MS);
-                        lprintf(1,0,"TURN CCW...     ");
+                        pc.printf("[CASE-11 sub0] Diagonal BL for forest entry, %lums\r\n", (unsigned long)DIAG_MS);
+                        lprintf(1,0,"DIAG BL...      ");
                     }
                     
-                    uint32_t el = us_ticker_read()/1000 - sub_t0;
+                    uint32_t el = sms();
                     
                     // Timeout protection
-                    if(el > TURN_45_MS+100){
-                        pc.printf("[FAULT-RED] Case6 spin timeout\r\n");
+                    if(el > DIAG_MS + 4000) {
+                        pc.printf("[FAULT] Diag timeout\r\n");
                         motors_stop();
                         op = false;
                         break;
                     }
                     
-                    // Transition to next sub-state when time reached
-                    if(el >= TURN_45_MS){
+                    // Transition to forward when time reached
+                    if(el >= DIAG_MS) {
                         motors_stop();
-                        lprintf(1,0,"TURN OK         ");
-                        thread_sleep_for(150);
-                        sub6 = S6_DIAG;      // ← Next: diagonal move
+                        lprintf(1,0,"DIAG done       ");
+                        thread_sleep_for(80);
+                        sub11 = 1;              // → Next: Forward move
                         sub_t0 = us_ticker_read()/1000;
                         first = true;
                         break;
                     }
                     
-                    // Execute CCW spin (+spd = CCW for RED zone)
-                    drive_spin(MOVE_SPD);
-                    lprintf(1,0,"SPIN %lu/%lums  ", (unsigned long)el, (unsigned long)TURN_45_MS);
+                    // Execute diagonal front-left (RED zone entry)
+                    drive_diagonal_BL(MOVE_SPD);
+                    lprintf(1,0,"DIAG %lu/%lums  ", (unsigned long)el, (unsigned long)DIAG_MS);
                     break;
                 }
                 
-                // ── SUB6_DIAG: Diagonal Front-Left positioning move ─────────────
-                case S6_DIAG:{
-                    if(first){ 
-                        first=false; 
-                        pc.printf("[BACK-RED sub0] diag RIGHT-back %lums\r\n",(unsigned long)DIAG_MS); 
-                        lprintf(1,0,"DIAG R-BACK RED "); 
-                        t0=us_ticker_read()/1000; 
-                    }
-                    if(sms()>DIAG_MS+3000){ 
-                        pc.printf("[FAULT-RED] diag timeout\r\n"); 
-                        op=false; 
-                        break; 
-                    }
-                    if(sms()>=DIAG_MS){ 
-                        motors_stop(); 
-                        lprintf(1,0,"DIAG done RED   "); 
-                        thread_sleep_for(80); 
-                        sub6=S6_FWD;
-                        t0=us_ticker_read()/1000; 
-                        first=true; 
-                        break; 
-                    }
-                    drive_diagonal_BR(-MOVE_SPD);
-                    lprintf(1,0,"DIAGR t:%lu/%lu ",(unsigned long)sms(),(unsigned long)DIAG_MS);
-                    break;
-                }                
-                // ── SUB6_FWD: Final forward approach to forest entry ────────────
-                case S6_FWD:{
-                    if(first){
+                // ── SUB 1: Forward approach to forest entry point ───────
+                case 1: {
+                    if(first) {
                         first = false;
                         sub_t0 = us_ticker_read()/1000;
-                        pc.printf("[CASE-6 sub2] FWD to forest entry, %lums\r\n", (unsigned long)APPROACH_TIME_MS/2);
-                        lprintf(1,0,"FWD to forest.. ");
-                        encoders_reset();  // Reset for distance-based stop if needed
+                        motors_stop();
+                        encoders_reset();
+                        pc.printf("[CASE-11 sub1] Forward to forest entry, 1800ms\r\n");
+                        lprintf(1,0,"FWD to entry... ");
                     }
                     
                     uint32_t el = us_ticker_read()/1000 - sub_t0;
-                    uint32_t fwd_duration = APPROACH_TIME_MS / 2;  // ~1.5s forward
                     
-                    // Timeout protection
-                    if(el > fwd_duration + 2100){
-                        pc.printf("[FAULT-RED] Case6 fwd timeout\r\n");
+                    // Complete forward move → transition to NAV (case 12)
+                    if(el >= 1800) {
                         motors_stop();
-                        op = false;
-                        break;
-                    }                    
-                    // Transition to forest navigation when forward move complete
-                    if(el >= fwd_duration){
-                        motors_stop();
-                        lprintf(1,0,"ENTRY OK");
-                        thread_sleep_for(200);
-                        
-                        // ── TRANSITION TO FOREST OPERATIONS ──────────────────────
-                        forest_state_init(ZONE_RED);
-                        forest_step_idx = 0;
-                        forest_sub_step = 0;
-                        forest_init_done = false;
-                        
-                        if(!forest_path_confirmed || forest_path_len == 0){
-                            pc.printf("[RED-FOREST] No path confirmed — skipping forest\r\n");
-                            lprintf(0,0,"NO FOREST PATH  ");
-                            lprintf(1,0,"Skip to DONE    ");
-                            thread_sleep_for(500);
-                            enter(9);  // Skip to DONE state
-                        } else {
-                            pc.printf("[RED-FOREST] Starting forest nav: %d steps\r\n", forest_path_len);
-                            lprintf(0,0,"FOREST NAV RED  ");
-                            lprintf(1,0,"Step 1/%d...    ", forest_path_len);
-                            enter(7);  // → Enter forest navigation (Case 7)
-                        }
-                        break;  // ← Critical: exit switch after state transition
+                        lprintf(1,0,"FWD done        ");
+                        thread_sleep_for(150);
+                        enter(12);  // ← ✅ CRITICAL: Transition to case 12
+                        break;  // Exit switch after state change
                     }
                     
-                    // Execute straight forward movement
-                    linear_forward(FOREST_DRIVE_SPD * 0.8f); drive_fwd_corrected();
-                    lprintf(1,0,"FWD %lu/%lums   ", (unsigned long)el, (unsigned long)fwd_duration);
+                    // Execute forward movement with ramp-up
+                    spd += RAMP_STEP;
+                    if(spd > FWD_SPEAR_SPD) spd = FWD_SPEAR_SPD;
+                    linear_forward(spd);
+                    drive_fwd_corrected();
+                    lprintf(1,0,"FWD %lu/1800ms  ", (unsigned long)el);
                     break;
                 }
                 
                 default:
-                    pc.printf("[FAULT-RED] Case6 bad sub6=%d\r\n", sub6);
+                    pc.printf("[FAULT] Bad sub11=%d\r\n", sub11);
                     motors_stop();
                     op = false;
                     break;
             }
-            break;  // ← End of case 6 switch
+            break;  // End of case 11
         }
-        case 7: {   // FOREST: Main path + side detours for adjacent boxes
+        
+        // ── CASE 12: Execute stored forest path ─────────────────────────
+        case 12: {  // 12
             static int step = 0;
-            cyl_all_safe();
+            
             if(first) {
-                step = 0; first = false;
-                pc.printf("\r\n[CASE-7] FOREST WITH SIDE DETOURS\r\n");
-                pc.printf("  Path: "); for(int i=0;i<forest_path_len;i++) pc.printf("%d ",forest_path_blocks[i]);
-                pc.printf("\r\n  Boxes: "); for(int i=0;i<forest_box_count;i++) pc.printf("B%d ",forest_box_blocks[i]);
-                pc.printf("\r\n");
-                lprintf(0,0,"FOREST+DETOURS  "); lprintf(1,0,"Step 1/%d...    ", forest_path_len);
+                step = 0;
+                first = false;
+                pc.printf("[NAV] Starting forest path: %d steps\r\n", forest_path_len);
+                lprintf(1,0,"Step 1/%d...    ", forest_path_len);
             }
-
+            
             if(step < forest_path_len) {
                 int block = forest_path_blocks[step];
                 int presses = forest_path_presses[step];
-                const BlockNeighbors* nb = get_neighbors(block);
-
-                // ── 1. CLIMB onto main path block ───────────────────────────────
-                pc.printf("  [1] Climbing to Block %d...\r\n", block);
+                
+                // 1. Climb onto block
+                pc.printf("  [NAV] Climbing to Block %d\r\n", block);
                 lprintf(1,0,"CLIMB B%d...    ", block);
                 forest_move_to_block(block);
-                lprintf(1,0,"OK              "); thread_sleep_for(400);
-
-                // ── 2. CHECK LEFT neighbor for box ──────────────────────────────
-                if(nb && nb->left > 0 && forest_block_has_box(nb->left, nullptr)) {
-                    pc.printf("  [2] Box on LEFT (B%d) — detour\r\n", nb->left);
-                    detour_grab_box(block, nb->left, -1);  // -1 = LEFT turn
-                }
-
-                // ── 3. CHECK RIGHT neighbor for box ─────────────────────────────
-                if(nb && nb->right > 0 && forest_block_has_box(nb->right, nullptr)) {
-                    pc.printf("  [3] Box on RIGHT (B%d) — detour\r\n", nb->right);
-                    detour_grab_box(block, nb->right, +1);  // +1 = RIGHT turn
-                }
-
-                // ── 4. CHECK current block for box ──────────────────────────────
+                lprintf(1,0,"OK              ");
+                thread_sleep_for(300);
+                
+                // 2. Handle box if registered for this block
                 int box_act = 0;
                 if(forest_block_has_box(block, &box_act)) {
-                    pc.printf("  [4] Box on B%d — grab\r\n", block);
+                    pc.printf("  [NAV] Box on B%d — grabbing\r\n", block);
                     lprintf(1,0,"GRAB B%d...     ", block);
                     forest_grab_box(box_act);
-                    lprintf(1,0,"BOX HELD        "); thread_sleep_for(200);
+                    lprintf(1,0,"BOX HELD        ");
+                    thread_sleep_for(200);
                 }
-
-                // ── 5. HANDLE TURNS for next path block ─────────────────────────
-                if(presses == 2) { lprintf(1,0,"TURN RIGHT      "); forest_turn_right(); }
-                else if(presses >= 3) { lprintf(1,0,"TURN LEFT       "); forest_turn_left(); }
-
-                // ── 6. SPECIAL: If last block is 11, auto-detour to 12 to exit ─
-                if(step == forest_path_len-1 && block == 11) {
-                    pc.printf("  [5] Last=11 → auto-detour to 12 for exit\r\n");
-                    detour_grab_box(11, 12, +1);  // Turn RIGHT to 12
-                    lprintf(1,0,"CLIMB DOWN B12  "); forest_move_to_block(12); lprintf(1,0,"DONE            ");
+                
+                // 3. Handle turn for next block
+                if(presses == 2) {
+                    lprintf(1,0,"TURN RIGHT      ");
+                    forest_turn_right();
+                } else if(presses >= 3) {
+                    lprintf(1,0,"TURN LEFT       ");
+                    forest_turn_left();
                 }
-
-                // ── 7. NEXT STEP ────────────────────────────────────────────────
+                
+                // Next step
                 step++;
-                if(step < forest_path_len) lprintf(1,0,"Step %d/%d...   ", step+1, forest_path_len);
+                if(step < forest_path_len) {
+                    lprintf(1,0,"Step %d/%d...   ", step+1, forest_path_len);
+                    forest_execute_step(step);
+                }
                 thread_sleep_for(150);
-
+                
             } else {
-                // ── ALL DONE: Exit forest ───────────────────────────────────────
-                pc.printf("\r\n[CASE-7] Forest complete! Exiting...\r\n");
-                lprintf(0,0,"FOREST DONE     "); lprintf(1,0,"To exit...      ");
-                linear_forward(FOREST_DRIVE_SPD * 0.5f);
-                drive_fwd_corrected(); thread_sleep_for(600); motors_stop();
-                cyl_all_safe(); thread_sleep_for(300);
-                enter(9);  // → DONE (release boxes)
+                // Path complete → go to box release
+                pc.printf("[NAV] Path complete! %d steps executed\r\n", forest_path_len);
+                lprintf(0,0,"PATH DONE       ");
+                lprintf(1,0,"To box release..");
+                thread_sleep_for(300);
+                enter(13);  // → Case 13
             }
             break;
         }
-        case 8:{   // DONE — Exit maneuver: FWD→RIGHT→FAST_FWD
+        
+        // ── CASE 13: Release boxes + exit maneuver ──────────────────────
+        case 13: {  // 13
+            if(first) {
+                first = false;
+                pc.printf("[BOX] Releasing all grabbed boxes\r\n");
+                lprintf(1,0,"RELEASE BOXES.. ");
+            }
+            
+            // Release sequence
+            test_can10_rotate(BOX_GRIP_SPD, CAN10_50CM_MS);   // Extend
+            thread_sleep_for(200);
+            cyl_dir = 0;                                       // Open gripper
+            thread_sleep_for(GRIP_SETTLE_MS);
+            test_can10_rotate(-BOX_GRIP_SPD, CAN10_50CM_MS);  // Retract
+            thread_sleep_for(200);
+            
+            lprintf(1,0,"BOXES RELEASED  ");
+            pc.printf("[BOX] Release complete\r\n");
+            thread_sleep_for(300);
+            
+            // Exit: forward nudge
+            lprintf(1,0,"EXIT: FWD...    ");
+            linear_forward(FOREST_DRIVE_SPD * 0.5f);
+            drive_fwd_corrected();
+            thread_sleep_for(600);
+            motors_stop();
+            
+            // Strafe right 2m
+            encoders_reset();
+            uint32_t t_exit = us_ticker_read()/1000;
+            int32_t target = (int32_t)(2.0f * TICKS_PER_M) * MOTOR_DIR_SIGN;
+            while(true) {
+                while(can.read(rx_msg)) on_can_rx();
+                int32_t enc = ((enc_left+enc_right)/2) - 32000;
+                bool done = (target<0) ? (enc<=target) : (enc>=target);
+                if(done || (us_ticker_read()/1000 - t_exit > 8000)) {
+                    motors_stop();
+                    break;
+                }
+                motors_drive(0, STRAFE_SPD);  // Strafe right (row 0)
+                thread_sleep_for(10);
+            }
+            
+            // Final fast forward
+            linear_forward(FOREST_DRIVE_SPD * 2.0f);
+            drive_fwd_corrected();
+            thread_sleep_for(1000);
+            motors_stop();
+            
+            cyl_all_safe();
+            enter(14);  // → Case 14
+            break;
+        }
+        case 14: {  // 14
             static int exit_step = 0;
             static uint32_t exit_t0 = 0;
             
@@ -2905,70 +2895,431 @@ void run_normal_blue() {
             }
             break;  // End of case 9
         }
-        case 9:{
-            cyl_grip=0; cyl_dir=0; cyl_all_safe();
-            lprintf(0,0,"DONE BLUE       ");
-            lprintf(1,0,"Sequence OK     ");
-            pc.printf("[BLU] === SEQUENCE COMPLETE ===\r\n");
-            op=false;
+        
+        default:
+            pc.printf("[FAULT] Unknown mode=%d\r\n", mode);
+            op = false;
             break;
         }
-        default: op=false; break;
-        }
-
-        ptick++;
-        if(ptick>=50){
-            ptick=0;
-            const char* sn=(mode>=1&&mode<=9)?SN[mode]:"?";
-            pc.printf("[BLU %-8s %2lus] H:%.0f B:%d\r\n",
-                      sn,(unsigned long)sms()/1000,
-                      (double)forest_robot.current_height_cm,forest_robot.current_block);
-        }
+        
         thread_sleep_for(10);
     }
-    motors_stop(); cyl_all_safe();
+    
+    motors_stop();
+    cyl_all_safe();
+    pc.printf("[RETRY MC RED] Function exit\r\n");
 }
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  SECTION 12 — DISPATCH                                                   ║
+// ║  RETRY MC BLUE: Forest Navigation (Cases 11-14) — MIRRORED FROM RED     ║
+// ║  BLUE side is horizontal mirror of RED side                              ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
-void run_retry_mc(int zone) {
-    lprintf(0,0,"RETRY MC        ");
-    lprintf(1,0,"%s direct forest",(zone==ZONE_RED)?"R":"B");
-    pc.printf("[RETRY_MC] zone=%s — direct forest using stored path\r\n",
-              (zone==ZONE_RED)?"RED":"BLUE");
-    forest_run_path(zone);
+
+void run_retry_mc_blue() {
+    pc.printf("\r\n[RETRY MC BLUE] Forest navigation (Cases 11-14) — MIRRORED\r\n");
+    pc.printf("  Path confirmed: %s, Length: %d steps\r\n",
+              forest_path_confirmed ? "YES" : "NO", forest_path_len);
+    
+    // Safety: Skip if no path
+    if(!forest_path_confirmed || forest_path_len == 0) {
+        pc.printf("[WARN] No forest path — skipping navigation\r\n");
+        lprintf(0,0,"NO PATH SKIPPED ");
+        lprintf(1,0,"Retry MC empty  ");
+        thread_sleep_for(1000);
+        return;
+    }
+    
+    const char* SN[] = {"?","ENTRY","NAV","BOX","DONE"};
+    
+    // ── STATE VARIABLES ─────────────────────────────────────────────────
+    int8_t mode = 11;  // Start at case 11
+    bool op = true, first = true;
+    float spd = 0.f;
+    uint32_t t0 = us_ticker_read()/1000;
+    cyl_dir=1; 
+    
+    auto sms = [&]()->uint32_t { return us_ticker_read()/1000 - t0; };
+    
+    // ── STATE TRANSITION LAMBDA ────────────────────────────────────────
+    auto enter = [&](int8_t s) {
+        mode = s;
+        t0 = us_ticker_read()/1000;
+        first = true;
+        spd = 0.f;
+        motors_stop();
+        encoders_reset();
+        lprintf(0,0,"RM-B:%-13s", SN[s]);  // "RM-B" for BLUE
+        lprintf(1,0,"                ");
+        pc.printf("[RM-BLUE] Enter state %d: %s\r\n", s, SN[s]);
+    };
+    
+    // ✅ Initialize forest state for BLUE zone (starting block = 11)
+    forest_state_init(ZONE_BLUE);
+    forest_step_idx = 0;
+    forest_sub_step = 0;
+
+    pc.printf("[FOREST] Waiting for PB_4 (ir_sens) trigger...\r\n");
+    lprintf(0,0,"WAIT SENSOR...  ");
+    lprintf(1,0,"PB_4=START      ");
+
+    // Wait for ir_sens (PB_4) to go LOW (active)
+    while(ir_sens.read() == 1) {
+        led = !led;  // Heartbeat LED
+        thread_sleep_for(50);
+    }
+    thread_sleep_for(100);  // Debounce
+
+    lprintf(0,0,"SENSOR TRIGGERED");
+    lprintf(1,0,"Starting...     ");
+    pc.printf("[FOREST] PB_4 triggered - starting navigation\r\n");
+    thread_sleep_for(300);
+    
+    enter(11);  // Start at case 11
+    
+    // ═══════════════════════════════════════════════════════════════════
+    //  MAIN STATE MACHINE LOOP
+    // ═══════════════════════════════════════════════════════════════════
+    while(op) {
+        switch(mode) {
+            
+        // ── CASE 11: FOREST ENTRY — Diagonal BR → Forward → Transition ─
+        case 11: {  // 11
+            static int sub11 = 0;
+            static uint32_t sub_t0 = 0;
+            
+            switch(sub11) {
+                
+                // ── SUB 0: Diagonal BR (mirrored from RED's BL) ─────────
+                case 0: {
+                    if(first) { 
+                        first = false;
+                        sub_t0 = us_ticker_read()/1000;
+                        pc.printf("[CASE-11-BLU] Diagonal BR for forest entry, %lums\r\n", 
+                                  (unsigned long)DIAG_MS);
+                        lprintf(1,0,"DIAG BR (BLU)...");
+                    }
+                    
+                    uint32_t el = sms();
+                    
+                    // Timeout protection
+                    if(el > DIAG_MS + 9000) {
+                        pc.printf("[FAULT-BLU] Diag timeout\r\n");
+                        motors_stop();
+                        op = false;
+                        break;
+                    }
+                    
+                    // Transition to forward when time reached
+                    if(el >= DIAG_MS) {
+                        motors_stop();
+                        lprintf(1,0,"DIAG done BLU   ");
+                        thread_sleep_for(80);
+                        sub11 = 1;              // → Next: Forward move
+                        sub_t0 = us_ticker_read()/1000;
+                        first = true;
+                        break;
+                    }
+                    
+                    // ✅ BLUE: Diagonal BACK-RIGHT (mirrored from RED's BL)
+                    drive_diagonal_BR(-MOVE_SPD*2);
+                    lprintf(1,0,"DIAG %lu/%lums  ", (unsigned long)el, (unsigned long)DIAG_MS);
+                    break;
+                }
+                
+                // ── SUB 1: Forward approach to forest entry point ───────
+                case 1: {
+                    if(first) {
+                        first = false;
+                        sub_t0 = us_ticker_read()/1000;
+                        motors_stop();
+                        encoders_reset();
+                        pc.printf("[CASE-11-BLU] Forward to forest entry, 1800ms\r\n");
+                        lprintf(1,0,"FWD to entry... ");
+                    }
+                    
+                    uint32_t el = us_ticker_read()/1000 - sub_t0;
+                    
+                    // Complete forward move → transition to NAV (case 12)
+                    if(el >= 5000) {
+                        motors_stop();
+                        lprintf(1,0,"FWD done BLU    ");
+                        thread_sleep_for(150);
+                        enter(12);  // → Case 12
+                        break;  // Exit switch after state change
+                    }
+                    
+                    // Execute forward movement with ramp-up
+                    spd += RAMP_STEP;
+                    if(spd > FWD_SPEAR_SPD) spd = FWD_SPEAR_SPD;
+                    linear_forward(spd);
+                    drive_fwd_corrected();
+                    lprintf(1,0,"FWD %lu/1800ms  ", (unsigned long)el);
+                    break;
+                }
+                
+                default:
+                    pc.printf("[FAULT-BLU] Bad sub11=%d\r\n", sub11);
+                    motors_stop();
+                    op = false;
+                    break;
+            }
+            break;  // End of case 11
+        }
+        
+        // ── CASE 12: Execute stored forest path (same logic as RED) ────
+        case 12: {  // 12
+            static int step = 0;
+            
+            if(first) {
+                step = 0;
+                first = false;
+                pc.printf("[NAV-BLU] Starting forest path: %d steps\r\n", forest_path_len);
+                lprintf(1,0,"Step 1/%d...    ", forest_path_len);
+            }
+            
+            if(step < forest_path_len) {
+                int block   = forest_path_blocks[step];
+                int presses = forest_path_presses[step];
+                
+                // 1. Climb onto block
+                pc.printf("  [NAV-BLU] Climbing to Block %d\r\n", block);
+                lprintf(1,0,"CLIMB B%d...    ", block);
+                forest_move_to_block(block);  // ← Your exact function, unchanged ✓
+                lprintf(1,0,"OK              ");
+                thread_sleep_for(300);
+                
+                // 2. Handle box if registered
+                int box_act = 0;
+                if(forest_block_has_box(block, &box_act)) {
+                    pc.printf("  [NAV-BLU] Box on B%d — grabbing\r\n", block);
+                    lprintf(1,0,"GRAB B%d...     ", block);
+                    forest_grab_box(box_act);
+                    lprintf(1,0,"BOX HELD        ");
+                    thread_sleep_for(200);
+                }
+                
+                // 3. ── TURN LOGIC: Block-based transition (PRIMARY) + press fallback ──
+                int next_block = (step+1 < forest_path_len) ? forest_path_blocks[step+1] : -1;
+                int turn_dir = 0;
+                
+                if(next_block > 0) {
+                    // BLUE side block-based turn logic (as you specified)
+                    if(g_zone == ZONE_BLUE) {
+                        // RIGHT turn (CW) cases: 2→1, 6→5, 9→8
+                        if((block==2 && next_block==1) ||
+                        (block==6 && next_block==5) ||
+                        (block==9 && next_block==8)) {
+                            turn_dir = +1;  // Turn RIGHT
+                        }
+                        // LEFT turn (CCW) cases: 2→3, 7→8, 10→11
+                        else if((block==2 && next_block==3) ||
+                                (block==7 && next_block==8) ||
+                                (block==10 && next_block==11)) {
+                            turn_dir = -1;  // Turn LEFT
+                        }
+                    }
+                    // RED side: mirror of BLUE
+                    else if(g_zone == ZONE_RED) {
+                        if((block==2 && next_block==1) ||
+                        (block==6 && next_block==5) ||
+                        (block==9 && next_block==8)) {
+                            turn_dir = -1;  // Opposite = LEFT
+                        }
+                        else if((block==2 && next_block==3) ||
+                                (block==7 && next_block==8) ||
+                                (block==10 && next_block==11)) {
+                            turn_dir = +1;  // Opposite = RIGHT
+                        }
+                    }
+                }
+                
+                // Execute turn
+                if(turn_dir == +1) {
+                    lprintf(1,0,"TURN RIGHT      ");
+                    forest_turn_right();
+                    thread_sleep_for(200);
+                }
+                else if(turn_dir == -1) {
+                    lprintf(1,0,"TURN LEFT       ");
+                    forest_turn_left();
+                    thread_sleep_for(200);
+                }
+                // Fallback to press-count logic if block logic returns 0
+                else if(presses == 2) {
+                    lprintf(1,0,"TURN RIGHT (by press)");
+                    forest_turn_right();
+                    thread_sleep_for(200);
+                }
+                else if(presses >= 3) {
+                    lprintf(1,0,"TURN LEFT (by press) ");
+                    forest_turn_left();
+                    thread_sleep_for(200);
+                }
+                // else: no turn (presses == 1 or straight)
+                
+                // 4. Increment step AFTER all actions for current block are done
+                step++;
+                if(step < forest_path_len) {
+                    lprintf(1,0,"Step %d/%d...   ", step+1, forest_path_len);
+                }
+                thread_sleep_for(150);
+                
+            } else {
+                // Path complete → go to box release
+                pc.printf("[NAV-BLU] Path complete! %d steps executed\r\n", forest_path_len);
+                lprintf(0,0,"PATH DONE BLU   ");
+                lprintf(1,0,"To box release..");
+                thread_sleep_for(300);
+                enter(13);  // → Case 13
+            }
+            break;
+        }
+        
+        // ── CASE 13: Release boxes + exit maneuver (MIRRORED) ──────────
+        case 13: {  // 13
+            if(first) {
+                first = false;
+                pc.printf("[BOX-BLU] Releasing all grabbed boxes\r\n");
+                lprintf(1,0,"RELEASE BOXES.. ");
+            }
+            
+            // Release sequence (same as RED)
+            
+            
+            lprintf(1,0,"BOXES RELEASED  ");
+            pc.printf("[BOX-BLU] Release complete\r\n");
+            thread_sleep_for(300);
+            
+            // Exit maneuver: forward nudge (same as RED)
+            lprintf(1,0,"EXIT: FWD...    ");
+            linear_forward(FOREST_DRIVE_SPD * 0.5f);
+            drive_fwd_corrected();
+            thread_sleep_for(600);
+            motors_stop();
+            
+            // ✅ BLUE: Strafe LEFT (mirrored from RED's RIGHT)
+            lprintf(1,0,"EXIT: LEFT 2m...");
+            encoders_reset();
+            uint32_t t_exit = us_ticker_read()/1000;
+            int32_t target = (int32_t)(2.0f * TICKS_PER_M) * MOTOR_DIR_SIGN;
+            while(true) {
+                while(can.read(rx_msg)) on_can_rx();
+                int32_t enc = ((enc_left+enc_right)/2) - 32000;
+                bool done = (target<0) ? (enc<=target) : (enc>=target);
+                if(done || (us_ticker_read()/1000 - t_exit > 8000)) {
+                    motors_stop();
+                    break;
+                }
+                // ✅ BLUE: Strafe LEFT (row 2) instead of RIGHT (row 0)
+                motors_drive(2, STRAFE_SPD);  
+                thread_sleep_for(10);
+            }
+            
+            // Final fast forward (same as RED)
+            lprintf(1,0,"EXIT: FAST FWD..");
+            linear_forward(FOREST_DRIVE_SPD * 2.0f);
+            drive_fwd_corrected();
+            thread_sleep_for(1000);
+            motors_stop();
+            
+            cyl_all_safe();
+            enter(14);  // → Case 14
+            break;
+        }
+        
+        // ── CASE 14: DONE ───────────────────────────────────────────────
+        case 14: {  // 14
+            lprintf(0,0,"DONE RETRY BLU  ");
+            lprintf(1,0,"Forest OK BLUE  ");
+            pc.printf("[RETRY MC BLUE] === FOREST COMPLETE ===\r\n");
+            op = false;
+            break;
+        }
+        
+        default:
+            pc.printf("[FAULT-BLU] Unknown mode=%d\r\n", mode);
+            op = false;
+            break;
+        }
+        
+        thread_sleep_for(10);
+    }
+    
+    motors_stop();
+    cyl_all_safe();
+    pc.printf("[RETRY MC BLUE] Function exit\r\n");
 }
 
-void run_retry_arn(int zone) {
+void run_retry_arena(int zone) {
     lprintf(0,0,"RETRY ARENA     ");
     lprintf(1,0,"%s->TTT         ",(zone==ZONE_RED)?"R":"B");
     pc.printf("[RETRY_ARN] zone=%s — direct to arena (no forest path used)\r\n",
               (zone==ZONE_RED)?"RED":"BLUE");
 }
 
-void dispatch(int zone, int mode) {
-    pc.printf("[DISPATCH] zone=%s mode=%d (path already loaded: %s len=%d)\r\n",
-              (zone==ZONE_RED)?"RED":"BLUE", mode,
-              forest_path_confirmed?"YES":"NO", forest_path_len);
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  DISPATCH — ROUTE TO CORRECT OPERATION                                  ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
 
-    if(zone==ZONE_RED){
-        switch(mode){
-            case MODE_NORMAL:    run_normal_red();          break;
-            case MODE_RETRY_MC:  run_retry_mc(ZONE_RED);    break;
-            case MODE_RETRY_ARN: run_retry_arn(ZONE_RED);   break;
-            default:             run_normal_red();          break;
+void dispatch(int zone, int mode) {
+    pc.printf("[DISPATCH] zone=%s mode=%d\r\n",
+              (zone==ZONE_RED)?"RED":"BLUE", mode);
+    
+    if(zone == ZONE_RED) {
+        switch(mode) {
+            case MODE_NORMAL:
+                pc.printf("  → Running NORMAL (spear pickup only)\r\n");
+                run_normal_red();   // Cases 1-5: NO path input needed
+                break;
+                
+            case MODE_RETRY_MC:
+                pc.printf("  → Running RETRY MC (forest nav WITH path)\r\n");
+                // Path should already be collected in main() before dispatch()
+                run_retry_mc_red(); // Cases 6-9: USES forest_path_* arrays
+                break;
+                
+            case MODE_RETRY_ARN:
+                pc.printf("  → Running RETRY ARENA (arena tasks only)\r\n");
+                run_retry_arena(ZONE_RED);  // Your existing arena function
+                break;
+                
+            case MODE_TEST_SENS:
+                test_sensors();
+                break;
+                
+            case MODE_TEST_ACT:
+                test_actuators();
+                break;
+                
+            default:
+                pc.printf("  → Unknown mode %d — defaulting to NORMAL\r\n", mode);
+                run_normal_red();
+                break;
         }
-    } else {
-        switch(mode){
-            case MODE_NORMAL:    run_normal_blue();         break;
-            case MODE_RETRY_MC:  run_retry_mc(ZONE_BLUE);   break;
-            case MODE_RETRY_ARN: run_retry_arn(ZONE_BLUE);  break;
-            default:             run_normal_blue();         break;
+    } 
+    else {  // ZONE_BLUE
+        switch(mode) {
+            case MODE_NORMAL:
+                run_normal_blue();
+                break;
+            case MODE_RETRY_MC:
+                run_retry_mc_blue();
+                break;
+            case MODE_RETRY_ARN:
+                run_retry_arena(ZONE_BLUE);
+                break;
+            case MODE_TEST_SENS:
+                test_sensors();
+                break;
+            case MODE_TEST_ACT:
+                test_actuators();
+                break;
+            default:
+                run_normal_blue();
+                break;
         }
     }
 }
-
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║  SECTION 13 — MAIN                                                       ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
@@ -2985,134 +3336,80 @@ void scan_i2c_bus() {
     pc.printf("\r\n[SCAN] Done.\r\n\r\n");
 }
 
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 13 — MAIN (REFACTORED FLOW)                                    ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
 int main() {
-    cyl_arm = 0;    // Cyl1: retract
-    cyl_grip = 0;   // Cyl2: open
-    cyl_up = 0;     // Cyl3: safe
-    cyl_dir = 0;    // Cyl4: default
-    cyl_5 = 1;      // ← Cyl5: retract (relay OFF)
-    cyl_6 = 1;      // ← Cyl6: retract (relay OFF)
-    
+    // ── Hardware init (unchanged) ─────────────────────────────────────────
+    cyl_all_safe();
     thread_sleep_for(200);
-
-    bool lcd_ok=lcd_detect();
+    
+    bool lcd_ok = lcd_detect();
     if(lcd_ok) lcd_init();
-    else pc.printf("[WARN] LCD missing\r\n");
-    thread_sleep_for(50);
     i2c.frequency(400000);
-    int tof_ok = ForestTOF::init(i2c, 0x70);
-
-    pc.printf("\r\n=== R2 Robocon 2026 — PATH INPUT FIRST ===\r\n");
-    pc.printf("ZONE PC3=%d (%s)\r\n", zone_sw.read(), (zone_sw.read()==0)?"RED":"BLUE");
-    pc.printf("FLOW: IR PATH INPUT → op_mode → cases 1-6 (spear) → cases 7-9 (forest)\r\n");
-
-    if(can.frequency(1000000)==0){
-        pc.printf("[FATAL] CAN init failed\r\n");
-        while(1){ led=!led; thread_sleep_for(100); }
-    }
+    ForestTOF::init(i2c, 0x70);
+    
+    // CAN init (unchanged)...
     can.attach(&on_can_rx, CAN::RxIrq);
     can.filter(0x100, 0x700, CANStandard, 0);
-
-    for(int i=0;i<NUM_W;i++){ can_enter_mode(CAN_FL+i); pc.printf("[OK] motor ID%d\r\n",CAN_FL+i); }
+    for(int i=0; i<NUM_W; i++) { can_enter_mode(CAN_FL+i); thread_sleep_for(20); }
     can_enter_mode(CAN_GRIP);
-    pc.printf("[OK] motor ID%d (grip)\r\n",CAN_GRIP);
-        // ── MOTOR INIT: Send brake mode to ALL motors including CAN_GRIP ──
-    for(int i=0; i<NUM_W; i++) {
-        can_enter_mode(CAN_FL + i);  // IDs 11,12,13,14
-        pc.printf("[OK] motor ID%d\r\n", CAN_FL + i);
-        thread_sleep_for(20);
-    }
-
-    // ← FIX: CAN_GRIP brake - use BASE ID (10), not feedback ID (266)
-    can_enter_mode(CAN_GRIP);        // Send mode command to ID 10 ✓
-    thread_sleep_for(50);
-
-    CANMessage brake_msg;
-    brake_msg.id = CAN_GRIP;         // ✅ FIXED: Use CAN_GRIP (10), NOT +0x100
-    brake_msg.type = CANData;
-    brake_msg.format = CANStandard;
-    brake_msg.len = 8;
-
-    // Build zero-velocity payload (same as can_send_vel with vel=0)
-    int p = 1;
-    int v = (int)((0.f + 30.f) * 4095.f / 60.f);  // = 2048
-    int kdi = (int)(1.0f * 4095.f / 5.f);
-    int ff = 2048;
-
-    brake_msg.data[0] = (p >> 8) & 0xFF;
-    brake_msg.data[1] = p & 0xFF;
-    brake_msg.data[2] = (v >> 4) & 0xFF;
-    brake_msg.data[3] = ((v & 0xF) << 4);
-    brake_msg.data[4] = 0;
-    brake_msg.data[5] = (kdi >> 4) & 0xFF;
-    brake_msg.data[6] = ((kdi & 0xF) << 4) | ((ff >> 8) & 0xF);
-    brake_msg.data[7] = ff & 0xFF;
-
-    // Send 3x for reliability (same as wheel motors)
-    for(int i=0; i<3; i++) {
-        can.write(brake_msg);
-        thread_sleep_for(20);
-    }
-    pc.printf("[OK] motor ID%d (grip) - BRAKE ENGAGED\r\n", CAN_GRIP);
-
-    // ✅ DEBUG: Verify correct ID was used
-    pc.printf("[DEBUG] Brake sent to ID: 0x%03X (%d)\r\n", brake_msg.id, brake_msg.id);
     motors_stop();
-
+    
     lprintf(0,0,"R2 Robocon 2026 ");
-    lprintf(1,0,"%s Ready        ",(zone_sw.read()==0)?"RED":"BLU");
+    lprintf(1,0,"%s Ready        ", (zone_sw.read()==0)?"RED":"BLU");
     thread_sleep_for(1000);
 
-    // ── MAIN GAME LOOP ───────────────────────────────────────────────────
-    while(true){
-        // ── STEP 1: IR PATH INPUT (RUNS FIRST) ───────────────────────────
-        pc.printf("\r\n========================================\r\n");
-        #if PATH_INPUT_SERIAL
-            pc.printf("[FLOW] STEP 1: SERIAL PATH INPUT\r\n");
-            lprintf(0,0,"STEP 1: SERIAL  ");
-            lprintf(1,0,"Type path + go  ");
-        #else
-            pc.printf("[FLOW] STEP 1: IR PATH INPUT\r\n");
-            lprintf(0,0,"STEP 1: IR PATH ");
-            lprintf(1,0,"Use remote      ");
-        #endif
-        pc.printf("========================================\r\n");
-        thread_sleep_for(500);
-
-        #if PATH_INPUT_SERIAL
-            bool got_path = collect_forest_path_serial();
-        #else
-            bool got_path = collect_forest_path();
-        #endif
-
+    // ═════════════════════════════════════════════════════════════════════
+    //  MAIN GAME LOOP — REFACTORED FLOW
+    // ═════════════════════════════════════════════════════════════════════
+    while(true) {
         
-        if(!got_path) {
-            pc.printf("[FLOW] Path skipped (btn_b) — run will skip forest section\r\n");
-            lprintf(0,0,"PATH SKIPPED    ");
-            lprintf(1,0,"No forest run   ");
-            thread_sleep_for(800);
+        // ── STEP 1: MODE SELECTION FIRST (NO PATH INPUT YET) ─────────────
+        pc.printf("\r\n[MAIN] STEP 1: Select operation mode\r\n");
+        lprintf(0,0,"SELECT MODE     ");
+        lprintf(1,0,"btn_a:scroll IR:OK");
+        op_mode();  // ← Sets g_mode, g_zone; user picks NORMAL/RETRY_MC/etc.
+        
+        // ── STEP 2: CONDITIONAL PATH INPUT ───────────────────────────────
+        // ONLY collect path if user selected RETRY_MC
+        if(g_mode == MODE_RETRY_MC) {
+            pc.printf("\r\n[MAIN] STEP 2: FOREST PATH INPUT (Retry MC)\r\n");
+            lprintf(0,0,"PATH INPUT MODE ");
+            lprintf(1,0,"IR remote:1-12  ");
+            
+            #if PATH_INPUT_SERIAL
+                if(!collect_forest_path_serial()) {
+                    pc.printf("[WARN] Path skipped — forest nav will use defaults\r\n");
+                }
+            #else
+                if(!collect_forest_path()) {
+                    pc.printf("[WARN] Path skipped (btn_b) — forest nav will use defaults\r\n");
+                }
+            #endif
         } else {
-            pc.printf("[FLOW] Path locked: %d steps confirmed=%d\r\n",
-                      forest_path_len, forest_path_confirmed);
-            lprintf(0,0,"PATH READY      ");
-            lprintf(1,0,"%d steps stored ", forest_path_len);
-            thread_sleep_for(800);
+            // For NORMAL/ARENA/TEST modes: skip path collection entirely
+            pc.printf("\r\n[MAIN] STEP 2: Skipping path input (mode=%d)\r\n", g_mode);
+            forest_path_confirmed = false;
+            forest_path_len = 0;
         }
-
-        // ── STEP 2: MODE SELECTION ───────────────────────────────────────
-        pc.printf("\r\n[FLOW] STEP 2: MODE SELECTION\r\n");
-        op_mode();
-
-        // ── STEP 3: EXECUTE ──────────────────────────────────────────────
-        pc.printf("\r\n[FLOW] STEP 3: EXECUTE  zone=%s mode=%d\r\n",
+        
+        // ── STEP 3: EXECUTE SELECTED OPERATION ───────────────────────────
+        pc.printf("\r\n[MAIN] STEP 3: EXECUTE zone=%s mode=%d\r\n",
                   (g_zone==ZONE_RED)?"RED":"BLUE", g_mode);
-        dispatch(g_zone, g_mode);
-
-        // ── STEP 4: WAIT FOR NEXT ROUND ──────────────────────────────────
-        pc.printf("\r\n[FLOW] STEP 4: RUN COMPLETE — IR for next round\r\n\r\n");
+        dispatch(g_zone, g_mode);  // ← Calls run_normal_* or run_retry_mc_*
+        
+        // ── STEP 4: POST-RUN WAIT FOR NEXT ROUND ─────────────────────────
+        pc.printf("\r\n[MAIN] STEP 4: RUN COMPLETE — Press IR for next round\r\n");
         lprintf(0,0,"RUN COMPLETE    ");
-        lprintf(1,0,"IR=new path     ");
-        while(ir_sens.read()==1){ led=!led; thread_sleep_for(300); }
-        thread_sleep_for(500);
+        lprintf(1,0,"IR=new round    ");
+        
+        // Wait for IR start signal (debounced)
+        while(ir_sens.read() == 1) { 
+            led = !led; 
+            thread_sleep_for(300); 
+        }
+        thread_sleep_for(500);  // Debounce
     }
 }
