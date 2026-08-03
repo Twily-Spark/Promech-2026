@@ -1,0 +1,1263 @@
+/* =============================================================================
+   R2_Main.cpp  —  ABU Robocon 2026 "Kung Fu Quest"
+   Platform    : NUCLEO_F446RE  mbed OS5  ARMC6
+
+   RED vs BLUE MIRROR TABLE — only three differences:
+   ┌────────┬────────────────────────────────┬────────────────────────────────┐
+   │ State  │ RED                            │ BLUE                           │
+   ├────────┼────────────────────────────────┼────────────────────────────────┤
+   │ 3 SWEEP│ motors_drive(2, SPD)  = LEFT   │ motors_drive(0, SPD)  = RIGHT  │
+   │ 5 sub0 │ drive_diagonal(+MOVE_SPD)      │ drive_diagonal(-MOVE_SPD)      │
+   │        │   = diagonal right-back        │   = diagonal left-back         │
+   │ 5 sub1 │ drive_spin(+MOVE_SPD)  = CCW   │ drive_spin(-MOVE_SPD)  = CW    │
+   └────────┴────────────────────────────────┴────────────────────────────────┘
+   All other states (INIT, APPROACH, PICKUP, ROT_90, CYL14, HOLD) are identical.
+
+   STATE MAP:
+     1=INIT  2=APPROACH  3=SWEEP  4=PICKUP  5=BACK  6=ROT_90  7=CYL14  8=HOLD
+
+   PIN MAP:
+     CAN PA11/PA12  GIM8008 ID11-14
+     S1 PC0  S2 PA4
+     CYL1 PC7  CYL2 PB6  CYL4 PA6
+     ROT PWM PB14  DIRA PC6  DIRB PC8
+     HOME PC1  90DEG PA0
+     ZONE PC3 (0=RED 1=BLUE)  BTN_A PA10  BTN_B PB3  IR PA9
+     LCD PB9=SDA PB8=SCL
+   ============================================================================= */
+
+#include "mbed.h"
+#include <cmath>
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 1 — ALL CONFIGURATION HERE — ONLY CHANGE THIS SECTION          ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+float S1_K         = 43.057f;
+float S1_OFF       = 0.442f;
+float S2_K         = 43.057f;
+float S2_OFF       = 0.442f;
+
+float S1_SPEAR_CM  = 30.0f;
+float S2_RACK_CM   = 30.0f;
+int32_t APPROACH_TICKS = 1000;
+
+float APPROACH_SPD     = 3.0f;
+float BACK_SPD         = 3.0f;
+float STRAFE_SPD       = 0.6f;
+float FWD_SPEAR_SPD    = 1.5f;
+float ROT_DUTY         = 0.5f;
+
+// ── State 5 motion timings ────────────────────────────────────────────────
+// DIAG_MS:     how long the diagonal move runs (sub 0)
+// TURN_45_MS:  how long the spin runs (sub 1)
+// MOVE_SPD:    speed used for both diagonal and spin
+// For BLUE the same values are used but with negated sign (see state 5).
+uint32_t DIAG_MS         = 4000;
+uint32_t TURN_45_MS      = 1000;
+float    MOVE_SPD        = 3.0f;
+int32_t  BACK_TICKS      = 3000;
+uint32_t APPROACH_TIME_MS= 3000;
+uint32_t CYL_ARM_MS      = 1000;
+uint32_t GRIP_SETTLE_MS  = 500;
+uint32_t FWD_TO_SPEAR_MS = 1200;
+uint32_t CYL2_EXTEND_MS  = 600;
+uint32_t CYL1_RETRACT_MS = 800;
+uint32_t CYL4_MS         = 1000;   // *** tune: CYL4 full travel + 100ms margin ***
+uint32_t STRAFE_ASM_MS   = 1200;
+uint32_t ROT_TIMEOUT_MS  = 4000;
+uint32_t HOLD_MS         = 10000;
+uint32_t TURN_180_MS     = 2000;
+
+uint32_t SWEEP_MAX_MS    = 2500;
+int      CONFIRM_COUNT   = 5;
+int      SWEEP_PASSES    = 1;
+uint32_t SWEEP_RETURN_MS = 800;
+
+int32_t  BREAK_LINE     = 1200;
+int32_t  BREAKING_DRIFT = 60;
+float    RAMP_STEP      = 0.05f;
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 2 — HARDWARE OBJECTS  (do not change)                          ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+CAN        can(PA_11, PA_12, 1000000);
+Serial     pc(USBTX, USBRX, 115200);
+DigitalOut led(LED1);
+
+AnalogIn   sharp1(PC_0);
+AnalogIn   sharp2(PA_4);
+
+DigitalOut cyl_5 (PC_7);   // CYL1: 1=DOWN  0=retracted
+DigitalOut cyl_6(PB_6);   // CYL2: 0=OPEN  1=CLOSED/EXTEND
+DigitalOut cyl_arm (PA_6);   // CYL4: 0=Retracted  1=Extended
+DigitalOut cyl_grip(PA_7);
+DigitalOut cyl_up(PB_5);
+DigitalOut cyl_dir(PB_4); 
+
+PwmOut     rot_pwm (PB_14);
+DigitalOut rot_dira(PC_6);
+DigitalOut rot_dirb(PC_8);
+
+DigitalIn  sw_home(PC_1);
+DigitalIn  sw_90  (PA_0);
+
+DigitalIn  zone_sw(PC_3,  PullUp);  // 0=RED  1=BLUE
+DigitalIn  btn_a  (PA_10, PullUp);
+DigitalIn  btn_b  (PB_3,  PullUp);
+DigitalIn  ir_sens(PA_9,  PullUp);
+
+I2C        i2c_lcd(PB_9, PB_8);
+uint8_t    lcd_addr = 0x27;
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 3 — MODE CONSTANTS                                              ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+#define ZONE_RED       0
+#define ZONE_BLUE      1
+#define MODE_NORMAL    0
+#define MODE_RETRY_MC  1
+#define MODE_RETRY_ARN 2
+#define MODE_TEST_SENS 3
+#define MODE_TEST_ACT  4
+#define NUM_MODES      5
+
+int g_zone = ZONE_RED;
+int g_mode = MODE_NORMAL;
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 4 — CAN / MOTOR ENGINE                                          ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+#define CAN_FL 11
+#define CAN_BL 12
+#define CAN_BR 13
+#define CAN_FR 14
+#define NUM_W  4
+
+const float MOTOR_DIR[5][4] = {
+    { 1.0f,-1.0f,-1.0f, 1.0f},  // row 0: strafe RIGHT
+    {-1.0f,-1.0f, 1.0f, 1.0f},  // row 1: FORWARD
+    {-1.0f, 1.0f, 1.0f,-1.0f},  // row 2: strafe LEFT
+    { 1.0f, 1.0f,-1.0f,-1.0f},  // row 3: BACKWARD
+    { 1.0f, 0.0f,-1.0f,0.0f},  // row 4: Diagonal
+};
+
+CANMessage tx_msg, rx_msg;
+
+volatile int32_t  enc_left  = 32000;
+volatile int32_t  enc_right = 32000;
+         int32_t  old_stop  = 32000;
+
+volatile uint16_t last_pos[NUM_W]  = {2048,2048,2048,2048};
+volatile bool     first_rx[NUM_W]  = {true,true,true,true};
+volatile uint32_t last_rx_ms[NUM_W]= {0};
+
+float vel_l = 0.f, vel_r = 0.f;
+#define CORR_GAIN 16
+#define CORR_CAP  0.4f
+
+void can_send_vel(uint32_t id, float vel) {
+    if(vel < -30.f) vel = -30.f;
+    if(vel >  30.f) vel =  30.f;
+    int p   = 1;
+    int v   = (int)((vel + 30.f) * 4095.f / 60.f);
+    int kdi = (int)(1.0f * 4095.f / 5.f);
+    int ff  = 2048;
+    tx_msg.data[0] = (p  >> 8) & 0xFF;
+    tx_msg.data[1] =  p        & 0xFF;
+    tx_msg.data[2] = (v  >> 4) & 0xFF;
+    tx_msg.data[3] = ((v & 0xF) << 4);
+    tx_msg.data[4] = 0;
+    tx_msg.data[5] = (kdi >> 4) & 0xFF;
+    tx_msg.data[6] = ((kdi & 0xF) << 4) | ((ff >> 8) & 0xF);
+    tx_msg.data[7] =  ff & 0xFF;
+    tx_msg.id      = id;
+    tx_msg.type    = CANData;
+    tx_msg.format  = CANStandard;
+    tx_msg.len     = 8;
+    can.write(tx_msg);
+}
+
+void motors_drive(int row, float speed) {
+    for(int i = 0; i < NUM_W; i++) {
+        can_send_vel(CAN_FL + i, speed * MOTOR_DIR[row][i]);
+        wait_us(100);
+    }
+}
+
+void motors_stop() {
+    for(int k = 0; k < 3; k++) {
+        for(int i = 0; i < NUM_W; i++) {
+            can_send_vel(CAN_FL + i, 0.f);
+            wait_us(200);
+        }
+        wait_us(5000);
+    }
+    vel_l = vel_r = 0.f;
+}
+
+void can_enter_mode(uint32_t id) {
+    tx_msg.id = id; tx_msg.type = CANData; tx_msg.format = CANStandard; tx_msg.len = 8;
+    for(int i = 0; i < 7; i++) tx_msg.data[i] = 0xFF;
+    tx_msg.data[7] = 0xFC;
+    can.write(tx_msg);
+    thread_sleep_for(50);
+}
+
+void linear_forward(float spd) {
+    float c = 0.f;
+    if(enc_right > enc_left) {
+        c = (float)(enc_right - enc_left) / CORR_GAIN / 100.f;
+        if(c > CORR_CAP) c = CORR_CAP;
+        vel_r = spd - c;  vel_l = spd + c;
+    } else if(enc_left > enc_right) {
+        c = (float)(enc_left - enc_right) / CORR_GAIN / 100.f;
+        if(c > CORR_CAP) c = CORR_CAP;
+        vel_l = spd - c;  vel_r = spd + c;
+    } else { vel_l = vel_r = spd; }
+    if(vel_l < 0.1f) vel_l = 0.1f;  if(vel_l > 30.f) vel_l = 30.f;
+    if(vel_r < 0.1f) vel_r = 0.1f;  if(vel_r > 30.f) vel_r = 30.f;
+}
+void drive_fwd_corrected() {
+    can_send_vel(CAN_FL, -vel_l); wait_us(100);
+    can_send_vel(CAN_BL, -vel_l); wait_us(100);
+    can_send_vel(CAN_BR,  vel_r); wait_us(100);
+    can_send_vel(CAN_FR,  vel_r); wait_us(100);
+}
+void drive_diagonal_BR(float spd) {
+    can_send_vel(CAN_FL,  0.0f); wait_us(100);
+    can_send_vel(CAN_BL,  spd);  wait_us(100);
+    can_send_vel(CAN_BR,  0.0f); wait_us(100);
+    can_send_vel(CAN_FR, -spd);  wait_us(100);
+}
+void drive_diagonal_BL(float spd) {
+    can_send_vel(CAN_FL,   spd); wait_us(100);
+    can_send_vel(CAN_BL,  0.0f); wait_us(100);
+    can_send_vel(CAN_BR,  -spd); wait_us(100);
+    can_send_vel(CAN_FR,  0.0f); wait_us(100);
+}
+
+// ── drive_spin(spd) ───────────────────────────────────────────────────────
+// spd > 0 : CCW spin  (RED state 5 sub1)
+// spd < 0 : CW  spin  (BLUE state 5 sub1 — pass -MOVE_SPD)
+void drive_spin(float spd) {
+    can_send_vel(CAN_FL, spd); wait_us(100);
+    can_send_vel(CAN_BL, spd); wait_us(100);
+    can_send_vel(CAN_BR, spd); wait_us(100);
+    can_send_vel(CAN_FR, spd); wait_us(100);
+}
+
+void on_can_rx() {
+    if(!can.read(rx_msg) || rx_msg.len < 6) return;
+    uint32_t now = us_ticker_read() / 1000;
+    for(int i = 0; i < NUM_W; i++) {
+        if(rx_msg.id != (uint32_t)(CAN_FL + i + 0x100)) continue;
+        last_rx_ms[i] = now;
+        uint16_t pos = ((uint16_t)rx_msg.data[1] << 4) | (rx_msg.data[2] >> 4);
+        if(pos > 4095) continue;
+        if(first_rx[i]) { last_pos[i] = pos; first_rx[i] = false; continue; }
+        int16_t d = (int16_t)pos - (int16_t)last_pos[i];
+        if(d >  2048) d -= 4096;
+        if(d < -2048) d += 4096;
+        last_pos[i] = pos;
+        if(i == 0 || i == 1) enc_left  += (int32_t)d;
+        if(i == 2 || i == 3) enc_right += (int32_t)d;
+    }
+}
+
+void encoders_reset() {
+    __disable_irq();
+    enc_left = enc_right = old_stop = 32000;
+    for(int i = 0; i < NUM_W; i++) { last_pos[i] = 2048; first_rx[i] = true; }
+    __enable_irq();
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 5 — SHARP IR SENSORS                                            ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+float read_cm(AnalogIn& s, float K, float off) {
+    float v = (float)s.read_u16() / 65535.f * 3.3f;
+    if(v < 0.35f) return 999.f;
+    if(v > 2.90f) return 10.f;
+    float d = K / (v - off);
+    if(d < 10.f)  d = 10.f;
+    if(d > 150.f) return 999.f;
+    return d;
+}
+
+bool rack_in_range (float d) { return (d < S2_RACK_CM  && d > 1.f); }
+bool spear_detected(float d) { return (d < S1_SPEAR_CM && d > 1.f); }
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 6 — LCD 16×2 I2C                                               ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+void lcd_write(uint8_t d) { char c=(char)(d|0x08); i2c_lcd.write(lcd_addr<<1,&c,1); }
+void lcd_pulse(uint8_t d) { lcd_write(d|0x04); wait_us(1); lcd_write(d&~0x04); wait_us(50); }
+void lcd_nibble(uint8_t n, uint8_t rs) { lcd_pulse((n&0xF0)|rs|0x08); }
+void lcd_cmd(uint8_t c)      { lcd_nibble(c&0xF0,0); lcd_nibble((c<<4)&0xF0,0); wait_us(37);   }
+void lcd_cmd_slow(uint8_t c) { lcd_nibble(c&0xF0,0); lcd_nibble((c<<4)&0xF0,0); wait_us(1600); }
+void lcd_char(char c)        { lcd_nibble(c&0xF0,1); lcd_nibble((c<<4)&0xF0,1); wait_us(37);   }
+void lcd_str(const char* s)  { while(*s) lcd_char(*s++); }
+void lcd_clr()               { lcd_cmd_slow(0x01); }
+void lcd_pos(uint8_t r, uint8_t c) { lcd_cmd((r==0)?(0x80+c):(0xC0+c)); }
+
+void lprintf(uint8_t row, uint8_t col, const char* fmt, ...) {
+    char buf[17] = {0};
+    va_list a; va_start(a,fmt); vsnprintf(buf,17,fmt,a); va_end(a);
+    int l = strlen(buf); while(l < 16) buf[l++] = ' '; buf[16] = 0;
+    lcd_pos(row,col); lcd_str(buf);
+}
+
+bool lcd_detect() {
+    char d = 0;
+    if(i2c_lcd.write(0x27<<1,&d,0)==0) { lcd_addr=0x27; return true; }
+    if(i2c_lcd.write(0x3F<<1,&d,0)==0) { lcd_addr=0x3F; return true; }
+    return false;
+}
+
+void lcd_init() {
+    thread_sleep_for(50);
+    for(int i=0;i<3;i++) { lcd_pulse(0x03|0x08); wait_us(4500); }
+    lcd_pulse(0x02|0x08);
+    lcd_cmd(0x28); lcd_cmd(0x0C); lcd_cmd(0x06); lcd_cmd_slow(0x01);
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 7 — DC ROTATION MOTOR                                           ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+void rot_brake() {
+    rot_pwm = 0.f;
+    rot_dira = 1; rot_dirb = 1;
+    thread_sleep_for(50);
+    rot_dira = 0; rot_dirb = 0;
+}
+
+void rot_to_home() {
+    pc.printf("[ROT] ->90deg START\r\n");
+    lprintf(1, 0, "Rotating...     ");
+        
+    // === Inline rotation logic (from case 4) ===
+    rot_dira = 0;  rot_dirb = 1;         rot_pwm = ROT_DUTY;  // Ensure ROT_DUTY is defined (e.g., 0.3f)
+        
+    // Rotation loop with sensor monitoring
+    bool rotation_done = false;
+    for (int t = 0; t < 10 && !rotation_done; t++) {
+        thread_sleep_for(350);  // 200ms × 10 = 2s max rotation time
+            
+        // Check if 90° limit switch triggered
+        if (sw_90.read() == 1) {
+            pc.printf("  [SW_90] HIT at t=%dms\r\n", (t+1)*350);
+            rotation_done = true;
+            break;
+        }
+        // Optional: Emergency stop if home switch re-triggered
+        if (sw_home.read() == 1 && t > 2) {  // Ignore initial bounce
+            pc.printf("  [WARN] SW_HOME re-triggered, stopping\r\n");
+            break;
+        }
+        // Progress debug output
+        pc.printf("  t=%dms PA0=%d PA1=%d\r\n", 
+                (t+1)*200, sw_home.read(), sw_90.read());
+    }
+        
+    // Stop motor safely
+    rot_brake();  // Ensure this sets: rot_dira=0; rot_dirb=0; rot_pwm=0;
+    thread_sleep_for(50);  // Let motor settle
+        
+    // === Post-rotation verification ===
+    pc.printf("[ROT] done PA0=%d PA1=%d\r\n", sw_home.read(), sw_90.read());
+}
+
+void rot_to_90() {
+    pc.printf("[ROT] ->90deg START\r\n");
+    lprintf(1, 0, "Rotating...     ");
+        
+    // === Inline rotation logic (from case 4) ===
+    rot_dira = 1;  rot_dirb = 0;         rot_pwm = ROT_DUTY;  // Ensure ROT_DUTY is defined (e.g., 0.3f)
+        
+    // Rotation loop with sensor monitoring
+    bool rotation_done = false;
+    for (int t = 0; t < 10 && !rotation_done; t++) {
+        thread_sleep_for(200);  // 200ms × 10 = 2s max rotation time
+            
+        // Check if 90° limit switch triggered
+        if (sw_90.read() == 1) {
+            pc.printf("  [SW_90] HIT at t=%dms\r\n", (t+1)*200);
+            rotation_done = true;
+            break;
+        }
+            
+        // Optional: Emergency stop if home switch re-triggered
+        if (sw_home.read() == 1 && t > 2) {  // Ignore initial bounce
+            pc.printf("  [WARN] SW_HOME re-triggered, stopping\r\n");
+            break;
+        }
+            
+        // Progress debug output
+        pc.printf("  t=%dms PA0=%d PA1=%d\r\n", 
+                (t+1)*200, sw_home.read(), sw_90.read());
+    }
+        
+    // Stop motor safely
+    rot_brake();  // Ensure this sets: rot_dira=0; rot_dirb=0; rot_pwm=0;
+    thread_sleep_for(50);  // Let motor settle
+        
+    // === Post-rotation verification ===
+    pc.printf("[ROT] done PA0=%d PA1=%d\r\n", sw_home.read(), sw_90.read());
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 8 — OPERATION MODE                                              ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+int btn_a_prev=1, btn_b_prev=1, ir_prev=1;
+
+bool btn_a_edge() { int n=btn_a.read(); bool e=(btn_a_prev==1&&n==0); btn_a_prev=n; if(e) thread_sleep_for(50); return e; }
+bool btn_b_edge() { int n=btn_b.read(); bool e=(btn_b_prev==1&&n==0); btn_b_prev=n; if(e) thread_sleep_for(50); return e; }
+bool ir_edge()    { int n=ir_sens.read(); bool e=(ir_prev==1&&n==0);   ir_prev=n;   if(e) thread_sleep_for(30); return e; }
+
+const char* MODE_ROW0[NUM_MODES] = {
+    "0:NORMAL RUN    ", "1:RETRY MC      ", "2:RETRY ARENA   ",
+    "3:TEST SENSORS  ", "4:TEST ACTUATORS"
+};
+const char* MODE_ROW1_RED[NUM_MODES] = {
+    ">RED FULL SEQ   ", ">RED->FOREST    ", ">RED->ARENA KFS ",
+    ">IR=ENTER B=EXIT", ">IR=ENTER B=EXIT"
+};
+const char* MODE_ROW1_BLUE[NUM_MODES] = {
+    ">BLU FULL SEQ   ", ">BLU->FOREST    ", ">BLU->ARENA KFS ",
+    ">IR=ENTER B=EXIT", ">IR=ENTER B=EXIT"
+};
+
+void test_sensors() {
+    pc.printf("[TEST_SENS] BtnA=next page  BtnB=exit\r\n");
+    int page = 0;
+    const char* PN[] = { "PG0:SHARP SENS  ", "PG1:ROT SENSORS ", "PG2:INPUTS      " };
+    lprintf(0,0,"%s",PN[page]); lprintf(1,0,"A=page  B=exit  ");
+    thread_sleep_for(600);
+    while(true) {
+        if(btn_b_edge()) { lcd_clr(); return; }
+        if(btn_a_edge()) { page=(page+1)%3; lprintf(0,0,"%s",PN[page]); lprintf(1,0,"A=page  B=exit  "); }
+        float d1=read_cm(sharp1,S1_K,S1_OFF), d2=read_cm(sharp2,S2_K,S2_OFF);
+        const char* s1z=spear_detected(d1)?"SPEAR":(d1<40.f)?"near ":"EMPTY";
+        const char* s2z=rack_in_range(d2) ?"RACK!":(d2<40.f)?"near ":"far  ";
+        int zn=zone_sw.read(),ir=ir_sens.read(),ba=btn_a.read(),bb=btn_b.read();
+        int pa1=sw_home.read(),pa0=sw_90.read(),arm=cyl_arm.read(),grp=cyl_grip.read(),c4=cyl_dir.read();
+        const char* rp=(!pa0&&pa1)?"HOME":(pa0&&!pa1)?"90DG":(!pa0&&!pa1)?"ERR ":"MID ";
+        switch(page) {
+            case 0: lprintf(0,0,"S1:%5.1fcm %-5s  ",d1,s1z); lprintf(1,0,"S2:%5.1fcm %-5s  ",d2,s2z); break;
+            case 1: lprintf(0,0,"PA0:%d PA1:%d %-4s",pa0,pa1,rp); lprintf(1,0,"C1:%d C2:%d C4:%d   ",arm,grp,c4); break;
+            case 2: lprintf(0,0,"ZN:%-4s IR:%d A:%d B:%d",(zn==0)?"RED":"BLUE",ir,ba,bb); lprintf(1,0,"A=page  B=exit  "); break;
+        }
+        pc.printf("S1:%5.1fcm %-5s | S2:%5.1fcm %-5s | ZN:%-4s | PA0:%d PA1:%d %-4s | C1:%d C2:%d C4:%d\r\n",
+                  (double)d1,s1z,(double)d2,s2z,(zn==0)?"RED":"BLUE",pa0,pa1,rp,arm,grp,c4);
+        thread_sleep_for(500);
+    }
+}
+
+void test_actuators() {
+    const char* AN[] = {
+        "ARM DOWN        ",   // 0
+        "ARM UP (retract)",   // 1
+        "GRIP CLOSE      ",   // 2
+        "GRIP OPEN       ",   // 3
+        "ROT CW  2s(man) ",   // 4  manual — no sensor
+        "ROT CCW 2s(man) ",   // 5  manual — no sensor
+        "ROT->HOME PA1   ",   // 6  sensor-stopped CCW (PA1=0deg home)
+        "ROT->90  PA0    "    // 7  sensor-stopped CW  (PA0=90deg asm)
+    };
+    const int NUM_ACTS = 8;
+    int act = 0;
+
+    pc.printf("[TEST_ACT] A=next  IR=fire  B=exit\r\n");
+    pc.printf("Acts 0-3: cylinders.  4-5: motor manual.  6-7: motor+sensor.\r\n");
+    pc.printf("ROT_DUTY=%.2f  ROT_TIMEOUT=%lums\r\n",
+              (double)ROT_DUTY,(unsigned long)ROT_TIMEOUT_MS);
+
+    lprintf(0,0,"%s",AN[act]);
+    lprintf(1,0,"IR=fire  B=exit ");
+
+    uint32_t last_status = us_ticker_read()/1000;
+
+    while(true) {
+
+        // Exit
+        if(btn_b_edge()) {
+            rot_brake();
+            motors_stop();
+            lcd_clr();
+            return;
+        }
+
+        // Scroll
+        if(btn_a_edge()) {
+            act = (act + 1) % NUM_ACTS;
+            lprintf(0,0,"%s", AN[act]);
+            lprintf(1,0,"IR=fire  B=exit ");
+            pc.printf("[TEST_ACT] -> ACT%d: %s\r\n", act, AN[act]);
+        }
+
+        // Fire
+        if(ir_edge()) {
+            pc.printf("[TEST_ACT] FIRE ACT%d: %s\r\n", act, AN[act]);
+            lprintf(1,0,"FIRING...       ");
+
+            switch(act) {
+                case 0:   // ARM DOWN
+                    cyl_arm = 1;
+                    pc.printf("  cyl_arm=1 (PC7=HIGH=DOWN)\r\n");
+                    thread_sleep_for(CYL_ARM_MS);
+                    break;
+
+                case 1:   // ARM UP / retract
+                    cyl_arm = 0;
+                    pc.printf("  cyl_arm=0 (PC7=LOW=retract)\r\n");
+                    thread_sleep_for(CYL_ARM_MS);
+                    break;
+
+                case 2:   // GRIP CLOSE
+                    cyl_grip = 1;
+                    pc.printf("  cyl_grip=1 (PB6=HIGH=close)\r\n");
+                    thread_sleep_for(GRIP_SETTLE_MS);
+                    break;
+
+                case 3:   // GRIP OPEN
+                    cyl_grip = 0;
+                    pc.printf("  cyl_grip=0 (PB6=LOW=open)\r\n");
+                    thread_sleep_for(GRIP_SETTLE_MS);
+                    break;
+
+                case 4: { // ROT CW MANUAL — 2 seconds, no sensor
+                    pc.printf("  ROT CW manual: dira=1 dirb=0 pwm=%.2f\r\n",
+                              (double)ROT_DUTY);
+                    pc.printf("  PA5=%d PB0=%d at start\r\n",
+                              sw_home.read(),sw_90.read());
+                    lprintf(0,0,"ROT CW  2s      ");
+                    // CCW confirmed reaches HOME — so CW goes AWAY from home
+                    rot_dira = 1; rot_dirb = 0; rot_pwm = ROT_DUTY;
+                    // Run for 2000ms printing sensor every 200ms
+                    for(int t = 0; t < 10; t++) {
+                        thread_sleep_for(200);
+                        pc.printf("  t=%dms PA0=%d PA1=%d\r\n",
+                                  (t+1)*200, sw_home.read(),sw_90.read());
+                        lprintf(1,0,"t%ds PA0:%d PA1:%d ",
+                                t/5, sw_home.read(),sw_90.read());
+                    }
+                    rot_brake();
+                    pc.printf("  ROT CW done. PA0=%d PA1=%d\r\n",
+                              sw_home.read(),sw_90.read());
+                    break;
+                }
+
+                case 5: { // ROT CCW MANUAL — 2 seconds, no sensor
+                    // CCW confirmed reaches HOME (PA_0)
+                    pc.printf("  ROT CCW manual: dira=0 dirb=1 pwm=%.2f\r\n",
+                              (double)ROT_DUTY);
+                    pc.printf("  PA0=%d PA1=%d at start\r\n",
+                              sw_home.read(),sw_90.read());
+                    lprintf(0,0,"ROT CCW 2s      ");
+                    rot_dira = 0; rot_dirb = 1; rot_pwm = ROT_DUTY;
+                    for(int t = 0; t < 10; t++) {
+                        thread_sleep_for(200);
+                        pc.printf("  t=%dms PA5=%d PB0=%d\r\n",
+                                  (t+1)*200, sw_home.read(),sw_90.read());
+                        lprintf(1,0,"t%ds PA5:%d PB0:%d ",
+                                t/5, sw_home.read(),sw_90.read());
+                    }
+                    rot_brake();
+                    pc.printf("  ROT CCW done. PA5=%d PB0=%d\r\n",
+                              sw_home.read(),sw_90.read());
+                    break;
+                }
+
+                case 6:   // ROT->HOME sensor-stopped
+                    pc.printf("  rot_to_home(): CCW until PA1=LOW or %lums\r\n",
+                              (unsigned long)ROT_TIMEOUT_MS);
+                    lprintf(0,0,"ROT->HOME PA1   ");
+                    rot_to_home();
+                    pc.printf("  result: PA1(home)=%d (want 0)\r\n", sw_home.read());
+                    break;
+
+                case 7:   // ROT->90 sensor-stopped
+                    pc.printf("  rot_to_90(): CW until PA0=LOW or %lums\r\n",
+                              (unsigned long)ROT_TIMEOUT_MS);
+                    lprintf(0,0,"ROT->90  PA0    ");
+                    rot_to_90();
+                    pc.printf("  result: PA0(90deg)=%d (want 0)\r\n", sw_90.read());
+                    break;
+            }
+
+            // Show result on LCD + serial after any action
+            lprintf(0,0,"%s", AN[act]);
+            lprintf(1,0,"arm%d grp%d H%d 9%d",
+                    cyl_arm.read(),cyl_grip.read(),
+                    sw_home.read(),sw_90.read());
+            pc.printf("[RESULT] arm=%d grip=%d PA5=%d PB0=%d\r\n",
+                      cyl_arm.read(),cyl_grip.read(),
+                      sw_home.read(),sw_90.read());
+        }
+
+        // Live sensor status every 1s (non-static timestamp)
+        uint32_t now = us_ticker_read()/1000;
+        if(now - last_status >= 1000) {
+            last_status = now;
+            pc.printf("[STATUS] arm=%d grip=%d PA5=%d PB0=%d\r\n",
+                      cyl_arm.read(),cyl_grip.read(),
+                      sw_home.read(),sw_90.read());
+            // Keep LCD row 1 updated when idle
+            lprintf(1,0,"arm%d grp%d H%d 9%d",
+                    cyl_arm.read(),cyl_grip.read(),
+                    sw_home.read(),sw_90.read());
+        }
+
+        led = !led;
+        thread_sleep_for(100);
+    }
+}
+
+
+void op_mode() {
+    g_mode = MODE_NORMAL;
+    pc.printf("[OP] A=scroll  IR=confirm  B=cancel\r\n");
+    while(true) {
+        g_zone = (zone_sw.read()==0) ? ZONE_RED : ZONE_BLUE;
+        if(btn_a_edge()) { g_mode=(g_mode+1)%NUM_MODES; }
+        lprintf(0,0,"%s",MODE_ROW0[g_mode]);
+        lprintf(1,0,"%s",(g_zone==ZONE_RED)?MODE_ROW1_RED[g_mode]:MODE_ROW1_BLUE[g_mode]);
+        if(ir_edge()) {
+            if(g_mode==MODE_TEST_SENS){ lprintf(0,0,"TEST SENSORS    "); lprintf(1,0,"B=exit          "); thread_sleep_for(300); test_sensors(); g_mode=MODE_NORMAL; continue; }
+            if(g_mode==MODE_TEST_ACT) { lprintf(0,0,"TEST ACTUATORS  "); lprintf(1,0,"A=next IR=fire  "); thread_sleep_for(300); test_actuators(); g_mode=MODE_NORMAL; continue; }
+            break;
+        }
+        led=!led; thread_sleep_for(50);
+    }
+    while(true) {
+        const char* zn=(g_zone==ZONE_RED)?"RED ":"BLUE";
+        lprintf(0,0,"OK? %s M%d       ",zn,g_mode);
+        lprintf(1,0,"IR=GO  B=CANCEL ");
+        if(btn_b_edge()){ lprintf(0,0,"CANCELLED       "); lprintf(1,0,"A to scroll     "); thread_sleep_for(800); op_mode(); return; }
+        if(ir_edge())   { pc.printf("[OP] START zone=%s mode=%d\r\n",zn,g_mode); lprintf(0,0,"STARTING...     "); lprintf(1,0,"%s M%d GO!        ",zn,g_mode); thread_sleep_for(300); led=1; return; }
+        led=!led; thread_sleep_for(100);
+    }
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SHARED SUB-STATE DEFINES — used in both run functions                   ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+#define S4_FWD       0
+#define S4_CYL2_EXT  1
+#define S4_CYL1_RET  2
+#define S7_CYL1_DOWN 0
+#define S7_CYL4_EXT  1
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 9A — RED SIDE SEQUENCE                                          ║
+// ║                                                                          ║
+// ║  Seq: FWD → sweep LEFT → FWD(pickup) → diag RIGHT-BACK → spin CCW       ║
+// ║                                                                          ║
+// ║  State 3:    motors_drive(2, STRAFE_SPD)  = LEFT                        ║
+// ║  State 5s0:  drive_diagonal(+MOVE_SPD)    = right-back diagonal         ║
+// ║  State 5s1:  drive_spin(+MOVE_SPD)        = CCW spin                    ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+void run_normal_red() {
+
+    pc.printf("\r\n[RUN] RED: FWD->LEFT->FWD->diag-RIGHT-BACK->spin-CCW\r\n");
+
+    const char* SN[] = {
+        "?       ","INIT    ","APPROACH","SWEEP   ",
+        "PICKUP  ","BACK    ","ROT_90  ","CYL14   ","HOLD    "
+    };
+
+    int sub4=S4_FWD, sub5=0, sub7=S7_CYL1_DOWN, sub8=0;
+    uint32_t sub_t0=0;
+    int8_t  mode=0;
+    bool    op=true, first=true;
+    float   spd=0.f;
+    int     conf=0, ptick=0;
+    uint32_t t0=us_ticker_read()/1000;
+    
+
+    auto sms=[&]()->uint32_t{ return us_ticker_read()/1000-t0; };
+
+    auto enter=[&](int8_t s){
+        const char* from=(mode>=0&&mode<=8)?SN[mode]:"?";
+        const char* to  =(s   >=0&&s   <=8)?SN[s]   :"?";
+        pc.printf("\r\n[STATE-RED] %s -> %s  EL:%ld ER:%ld t:%lus\r\n",
+                  from,to,(long)enc_left,(long)enc_right,(unsigned long)sms()/1000);
+        mode=s; t0=us_ticker_read()/1000; conf=0; first=true; spd=0.f;
+        motors_stop(); encoders_reset();
+        lprintf(0,0,"R:%-14s",to);
+        lprintf(1,0,"                ");
+    };
+
+    encoders_reset();
+    enter(1);
+
+    while(op){
+        float d1=read_cm(sharp1,S1_K,S1_OFF);
+        float d2=read_cm(sharp2,S2_K,S2_OFF);
+
+        switch(mode){
+
+        case 1:{   // INIT
+            if(first){
+                first=false;
+                lprintf(1,0,"C1DN C2OPN C4=0 ");
+                cyl_arm=1; cyl_grip=0; cyl_dir=0;
+                thread_sleep_for(CYL_ARM_MS);
+                lprintf(1,0,"Rot->HOME RED   ");
+                lprintf(1,0,"INIT OK HOME=%d ",sw_home.read());
+                thread_sleep_for(300); enter(2);
+            }
+            break;
+        }
+
+        case 2:{   // APPROACH — forward
+            if(sms()>APPROACH_TIME_MS+1400){ pc.printf("[FAULT-RED] approach timeout\r\n"); op=false; break; }
+            if(sms()>=APPROACH_TIME_MS+200){ motors_stop(); lprintf(1,0,"APPROACH OK     "); thread_sleep_for(100); enter(3); break; }
+            spd+=RAMP_STEP; if(spd>APPROACH_SPD) spd=APPROACH_SPD;
+            linear_forward(spd); drive_fwd_corrected();
+            lprintf(1,0,"FWD %lu/%lums   ",(unsigned long)sms(),(unsigned long)APPROACH_TIME_MS);
+            break;
+        }
+
+        case 3:{   // SWEEP — LEFT (row 2)  ← RED
+            if(first) {
+                first = false;
+                pc.printf("[SWEEP] strafe LEFT\r\n");   
+                lprintf(1,0,"SWEEP LEFT...   ");
+            }
+            // Print S1 every 500ms
+            if(sms() % 500 < 15) {
+                pc.printf("[SWEEP] t=%lums S1=%.1fcm thresh=%.1fcm\r\n",
+                  (unsigned long)sms(), (double)d1, (double)S1_SPEAR_CM);
+            }
+            // Stop and go to PICKUP if anything within 30cm
+            if(d1 < S1_SPEAR_CM && d1 > 1.f) {
+                motors_stop();
+                pc.printf("[SWEEP] detected! S1=%.1fcm — stop and enter PICKUP\r\n",
+                  (double)d1);
+                lprintf(1,0,"DET %.1fcm      ", d1);
+                thread_sleep_for(100);
+                sub4 = S4_FWD;
+                enter(4);
+                break;
+            }
+            // Keep going left
+            motors_drive(2, STRAFE_SPD);   // row 2 = LEFT
+            lprintf(1,0,"S1:%.1fcm       ", d1);
+            break;
+        }
+
+        case 4:{   // PICKUP
+            switch(sub4){
+                case S4_FWD:{
+                    if(first){ first=false; sub_t0=us_ticker_read()/1000; motors_stop(); encoders_reset(); lprintf(1,0,"FWD 1600ms...   "); }
+                    uint32_t el=us_ticker_read()/1000-sub_t0;
+                    if(el>=1600){ motors_stop(); sub4=S4_CYL2_EXT; sub_t0=us_ticker_read()/1000; first=true; break; }
+                    spd+=RAMP_STEP; if(spd>FWD_SPEAR_SPD) spd=FWD_SPEAR_SPD;
+                    linear_forward(spd); drive_fwd_corrected();
+                    lprintf(1,0,"FWD %lu/1600ms  ",(unsigned long)el); break;
+                }
+                case S4_CYL2_EXT:{
+                    if(first){ first=false; sub_t0=us_ticker_read()/1000; cyl_grip=1; lprintf(1,0,"CYL2 extend...  "); }
+                    uint32_t el=us_ticker_read()/1000-sub_t0;
+                    lprintf(1,0,"CYL2 %lu/%lums  ",(unsigned long)el,(unsigned long)CYL2_EXTEND_MS);
+                    if(el>=CYL2_EXTEND_MS){ sub4=S4_CYL1_RET; sub_t0=us_ticker_read()/1000; first=true; } break;
+                }
+                case S4_CYL1_RET:{
+                    if(first){ first=false; sub_t0=us_ticker_read()/1000; cyl_arm=0; lprintf(1,0,"CYL1 retract... "); }
+                    uint32_t el=us_ticker_read()/1000-sub_t0;
+                    lprintf(1,0,"CYL1 %lu/%lums  ",(unsigned long)el,(unsigned long)CYL1_RETRACT_MS);
+                    if(el>=CYL1_RETRACT_MS){ pc.printf("[PICKUP-RED] done C1=%d C2=%d\r\n",cyl_arm.read(),cyl_grip.read()); lprintf(1,0,"PICKUP OK RED!  "); thread_sleep_for(200); enter(5); } break;
+                }
+                default: pc.printf("[FAULT-RED] bad sub4=%d\r\n",sub4); op=false; break;
+            }
+            break;
+        }
+
+        case 5:{   // BACK — diagonal RIGHT-back (sub0) + spin CCW (sub1)  ← RED
+            switch(sub5){
+                case 0:{
+                    if(first){ first=false; pc.printf("[BACK-RED sub0] diag RIGHT-back %lums\r\n",(unsigned long)DIAG_MS); lprintf(1,0,"DIAG R-BACK RED "); t0=us_ticker_read()/1000; }
+                    if(sms()>DIAG_MS+3000){ pc.printf("[FAULT-RED] diag timeout\r\n"); op=false; break; }
+                    if(sms()>=DIAG_MS){ motors_stop(); lprintf(1,0,"DIAG done RED   "); thread_sleep_for(80); sub5=1; t0=us_ticker_read()/1000; first=true; break; }
+                    drive_diagonal_BR(MOVE_SPD);   // +spd = diagonal RIGHT-back  ← RED
+                    lprintf(1,0,"DIAGR t:%lu/%lu ",(unsigned long)sms(),(unsigned long)DIAG_MS);
+                    break;
+                }
+                case 1:{
+                    if(first){ first=false; pc.printf("[BACK-RED sub1] spin CCW %lums\r\n",(unsigned long)TURN_45_MS); lprintf(1,0,"SPIN CCW RED    "); t0=us_ticker_read()/1000; }
+                    if(sms()>TURN_45_MS+500){ pc.printf("[FAULT-RED] spin timeout\r\n"); op=false; break; }
+                    if(sms()>=TURN_45_MS){ motors_stop(); lprintf(1,0,"SPIN done RED   "); thread_sleep_for(200); sub5=0; enter(6); break; }
+                    drive_spin(MOVE_SPD*2);   // +spd = CCW  ← RED
+                    lprintf(1,0,"CCW t:%lu/%lu   ",(unsigned long)sms(),(unsigned long)TURN_45_MS);
+                    break;
+                }
+                default: pc.printf("[FAULT-RED] bad sub5=%d\r\n",sub5); op=false; break;
+            }
+            break;
+        }
+
+        case 6:{   // ROT_90
+            if(first) {
+                first=false;
+                pc.printf("[ROT-RED] ->90deg CW\r\n");
+                lprintf(1,0,"Rotating RED... ");
+                rot_to_90();
+                pc.printf("[ROT-RED] done PA0=%d\r\n", sw_90.read());
+                lprintf(1,0,"Rot OK PA0=%d R ", sw_90.read());
+                thread_sleep_for(300);
+                enter(7);
+            }
+        }
+
+        case 7:{   // CYL1 DOWN → CYL4 EXTEND
+            switch(sub7){
+                case S7_CYL1_DOWN:{
+                    if(first){ first=false; sub_t0=us_ticker_read()/1000; cyl_arm=1; pc.printf("[S7_CYL1-RED] DOWN wait %lums\r\n",(unsigned long)CYL_ARM_MS); lprintf(1,0,"CYL1 DOWN RED   "); }
+                    uint32_t el=us_ticker_read()/1000-sub_t0;
+                    lprintf(1,0,"CYL1 %lu/%lums  ",(unsigned long)el,(unsigned long)CYL_ARM_MS);
+                    if(el>=CYL_ARM_MS){ sub7=S7_CYL4_EXT; sub_t0=us_ticker_read()/1000; first=true; } break;
+                }
+                case S7_CYL4_EXT:{
+                    if(first){ first=false; sub_t0=us_ticker_read()/1000; cyl_dir=1; pc.printf("[S7_CYL4-RED] extend C4=%d wait %lums\r\n",cyl_dir.read(),(unsigned long)CYL4_MS); lprintf(1,0,"CYL4 ext RED    "); }
+                    uint32_t el=us_ticker_read()/1000-sub_t0;
+                    lprintf(1,0,"CYL4 %lu/%lums  ",(unsigned long)el,(unsigned long)CYL4_MS);
+                    if(el>=CYL4_MS){ 
+                        // ── CYL4 extended, now HOLD CYL4+CYL2 for 10 seconds ──
+                        cyl_grip=1; cyl_dir=1;  // Ensure both held
+                        pc.printf("[S7_HOLD-RED] START 10s blocking wait (C4+Grip)\r\n"); 
+                        lprintf(1,0,"HOLD 10s RED... "); 
+                        thread_sleep_for(6000000);  // ← SIMPLE BLOCKING WAIT
+                        pc.printf("[S7_HOLD-RED] done C1=%d C2=%d C4=%d\r\n",cyl_arm.read(),cyl_grip.read(),cyl_dir.read()); 
+                        lprintf(1,0,"HOLD OK RED!    "); 
+                        thread_sleep_for(200); 
+                        enter(8);  // → proceed to case 8
+                    } 
+                break;
+                }
+                default: pc.printf("[FAULT-RED] bad sub7=%d\r\n",sub7); op=false; break;
+            }
+            break;
+        }
+
+        case 8:{   // RETRACT CYL2 + CYL4 → DONE — BLUE
+            if(first){ 
+                first=false; 
+                sub_t0=us_ticker_read()/1000; 
+                cyl_grip=0;  // CYL2: OPEN/release
+                cyl_dir=0;   // CYL4: RETRACT
+                pc.printf("[S8-BLU] Retract C2+C4 START\r\n"); 
+                lprintf(1,0,"C2+C4 retract.. "); 
+            }
+            uint32_t el=us_ticker_read()/1000-sub_t0;
+            lprintf(1,0,"Ret %lu/1000ms  ",(unsigned long)el);
+    
+            if(el>=1000){  // Wait 1s for cylinders to settle
+                motors_stop();
+                pc.printf("[S8-BLU] done C1=%d C2=%d C4=%d\r\n",cyl_arm.read(),cyl_grip.read(),cyl_dir.read()); 
+                lprintf(1,0,"DONE BLU!       "); 
+                thread_sleep_for(200);
+                pc.printf("[DONE-BLU] sequence complete\r\n"); 
+                lprintf(0,0,"DONE BLUE       "); 
+                lprintf(1,0,"Sequence OK BLU "); 
+                op=false; 
+            }
+            break;
+        }
+
+        case 9:{   // HOLD
+            lprintf(1,0,"hold %lus/10 RED",(unsigned long)sms()/1000);
+            if(sms()%1000<50) pc.printf("[HOLD-RED] %lus/10\r\n",(unsigned long)sms()/1000);
+            if(sms()>=HOLD_MS){ pc.printf("[DONE-RED] complete\r\n"); lprintf(0,0,"DONE RED        "); lprintf(1,0,"Sequence OK RED "); op=false; }
+            break;
+        }
+        default: pc.printf("[FAULT-RED] bad state %d\r\n",(int)mode); op=false; break;
+        }
+
+        ptick++;
+        if(ptick>=50){
+            ptick=0;
+            const char* sn=(mode>=1&&mode<=8)?SN[mode]:"?";
+            pc.printf("[RED %-8s %2lus] S1:%.1f EL:%ld ER:%ld spd:%.2f C1:%d C2:%d C4:%d s4:%d s7:%d\r\n",
+                      sn,(unsigned long)sms()/1000,(double)d1,(long)enc_left,(long)enc_right,
+                      (double)spd,cyl_arm.read(),cyl_grip.read(),cyl_dir.read(),sub4,sub7);
+        }
+        thread_sleep_for(10);
+    }
+    motors_stop(); rot_brake();
+    pc.printf("[RUN] run_normal_red complete\r\n");
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 9B — BLUE SIDE SEQUENCE                                         ║
+// ║                                                                          ║
+// ║  Seq: FWD → sweep RIGHT → FWD(pickup) → diag LEFT-BACK → spin CW         ║
+// ║                                                                          ║
+// ║  State 3:    motors_drive(0, STRAFE_SPD)  = RIGHT  ← BLUE (vs LEFT RED)  ║
+// ║  State 5s0:  drive_diagonal(-MOVE_SPD)    = left-back  ← BLUE (vs +RED)  ║
+// ║  State 5s1:  drive_spin(-MOVE_SPD)        = CW spin    ← BLUE (vs +RED)  ║
+// ║                                                                          ║
+// ║  All other states are byte-identical to RED.                             ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+void run_normal_blue() {
+
+    pc.printf("\r\n[RUN] BLUE: FWD->RIGHT->FWD->diag-LEFT-BACK->spin-CW  [MIRROR]\r\n");
+
+    const char* SN[] = {
+        "?       ","INIT    ","APPROACH","SWEEP   ",
+        "PICKUP  ","BACK    ","ROT_90  ","CYL14   ","HOLD    "
+    };
+
+    int sub4=S4_FWD, sub5=0, sub7=S7_CYL1_DOWN, sub8=0;
+    uint32_t sub_t0=0;
+    int8_t  mode=0;
+    bool    op=true, first=true;
+    float   spd=0.f;
+    int     conf=0, ptick=0;
+    uint32_t t0=us_ticker_read()/1000;
+
+    auto sms=[&]()->uint32_t{ return us_ticker_read()/1000-t0; };
+
+    auto enter=[&](int8_t s){
+        const char* from=(mode>=0&&mode<=8)?SN[mode]:"?";
+        const char* to  =(s   >=0&&s   <=8)?SN[s]   :"?";
+        pc.printf("\r\n[STATE-BLU] %s -> %s  EL:%ld ER:%ld t:%lus\r\n",
+                  from,to,(long)enc_left,(long)enc_right,(unsigned long)sms()/1000);
+        mode=s; t0=us_ticker_read()/1000; conf=0; first=true; spd=0.f;
+        motors_stop(); encoders_reset();
+        lprintf(0,0,"B:%-14s",to);
+        lprintf(1,0,"                ");
+    };
+
+    encoders_reset();
+    enter(1);
+
+    while(op){
+        float d1=read_cm(sharp1,S1_K,S1_OFF);
+        float d2=read_cm(sharp2,S2_K,S2_OFF);
+
+        switch(mode){
+
+        case 1:{   // INIT — identical to RED
+            if(first){
+                first=false;
+                lprintf(1,0,"C1DN C2OPN C4=0 ");
+                cyl_arm=1; cyl_grip=0; cyl_dir=0;
+                thread_sleep_for(CYL_ARM_MS);
+                lprintf(1,0,"INIT OK HOME=%d ",sw_home.read());
+                thread_sleep_for(300); enter(2);
+            }
+            break;
+        }
+
+        case 2:{   // APPROACH — forward, identical to RED
+            if(sms()>APPROACH_TIME_MS+1500){ pc.printf("[FAULT-BLU] approach timeout\r\n"); op=false; break; }
+            if(sms()>=APPROACH_TIME_MS+500){ motors_stop(); lprintf(1,0,"APPROACH OK BLU "); thread_sleep_for(100); enter(3); break; }
+            spd+=RAMP_STEP; if(spd>APPROACH_SPD) spd=APPROACH_SPD;
+            linear_forward(spd); drive_fwd_corrected();
+            lprintf(1,0,"FWD %lu/%lums   ",(unsigned long)sms(),(unsigned long)APPROACH_TIME_MS);
+            break;
+        }
+
+        case 3:{   // SWEEP — STRAFE RIGHT (row 0) — BLUE SIDE
+            if(first){ 
+                first = false; 
+                pc.printf("[SWEEP-BLU] START: strafing RIGHT (row 0)\r\n");
+                pc.printf("  MOTOR_DIR[0] = {%.1f, %.1f, %.1f, %.1f}\r\n", 
+                          MOTOR_DIR[0][0], MOTOR_DIR[0][1], MOTOR_DIR[0][2], MOTOR_DIR[0][3]);
+                lprintf(1,0,"SWEEP RIGHT BLU ");
+            }
+            
+            // Debug: Print sensor + motor commands every 200ms
+            if(sms() % 200 < 15) {
+                // Show what velocities we're sending
+                float fl_vel = STRAFE_SPD * MOTOR_DIR[0][0];  // Should be +0.6
+                float bl_vel = STRAFE_SPD * MOTOR_DIR[0][1];  // Should be -0.6
+                float br_vel = STRAFE_SPD * MOTOR_DIR[0][2];  // Should be -0.6
+                float fr_vel = STRAFE_SPD * MOTOR_DIR[0][3];  // Should be +0.6
+                
+                pc.printf("  [CMD] FL=%.2f BL=%.2f BR=%.2f FR=%.2f | S1=%.1fcm\r\n",
+                          fl_vel, bl_vel, br_vel, fr_vel, (double)d1);
+            }
+            
+            // Detection: spear found → stop and pickup
+            if(d1 < S1_SPEAR_CM && d1 > 1.f){
+                motors_stop(); 
+                pc.printf("[SWEEP-BLU] ✓ SPEAR DETECTED! S1=%.1fcm at t=%lums\r\n", 
+                          (double)d1, (unsigned long)sms());
+                lprintf(1,0,"SPEAR! %.1fcm   ", d1);
+                thread_sleep_for(100); 
+                sub4 = S4_FWD; 
+                enter(4); 
+                break;
+            }
+            
+            // Timeout protection
+            if(sms() > SWEEP_MAX_MS){
+                motors_stop(); 
+                pc.printf("[FAULT-BLU] Sweep timeout - no spear (S1=%.1fcm)\r\n", (double)d1);
+                lprintf(1,0,"NO SPEAR BLU!   "); 
+                op = false; 
+                break; 
+            }
+            
+            // ── ACTUAL MOVEMENT: Strafe RIGHT ──────────────────────────────
+            motors_drive(0, STRAFE_SPD);   // row 0 = {+1,-1,-1,+1} → RIGHT ✅
+            lprintf(1,0,"→ S1:%.1fcm     ", d1);
+            break;
+        }
+
+        case 4:{   // PICKUP — identical to RED (forward creep + CYL2 + CYL1)
+            switch(sub4){
+                case S4_FWD:{
+                    if(first){ first=false; sub_t0=us_ticker_read()/1000; motors_stop(); encoders_reset(); lprintf(1,0,"FWD 1600ms BLU  "); }
+                    uint32_t el=us_ticker_read()/1000-sub_t0;
+                    if(el>=1800){ motors_stop(); sub4=S4_CYL2_EXT; sub_t0=us_ticker_read()/1000; first=true; break; }
+                    spd+=RAMP_STEP; if(spd>FWD_SPEAR_SPD) spd=FWD_SPEAR_SPD;
+                    linear_forward(spd); drive_fwd_corrected();
+                    lprintf(1,0,"FWD %lu/1600ms  ",(unsigned long)el); break;
+                }
+                case S4_CYL2_EXT:{
+                    if(first){ first=false; sub_t0=us_ticker_read()/1000; cyl_grip=1; lprintf(1,0,"CYL2 ext BLU    "); }
+                    uint32_t el=us_ticker_read()/1000-sub_t0;
+                    lprintf(1,0,"CYL2 %lu/%lums  ",(unsigned long)el,(unsigned long)CYL2_EXTEND_MS);
+                    if(el>=CYL2_EXTEND_MS){ sub4=S4_CYL1_RET; sub_t0=us_ticker_read()/1000; first=true; } break;
+                }
+                case S4_CYL1_RET:{
+                    if(first){ first=false; sub_t0=us_ticker_read()/1000; cyl_arm=0; lprintf(1,0,"CYL1 ret BLU    "); }
+                    uint32_t el=us_ticker_read()/1000-sub_t0;
+                    lprintf(1,0,"CYL1 %lu/%lums  ",(unsigned long)el,(unsigned long)CYL1_RETRACT_MS);
+                    if(el>=CYL1_RETRACT_MS){ pc.printf("[PICKUP-BLU] done C1=%d C2=%d\r\n",cyl_arm.read(),cyl_grip.read()); lprintf(1,0,"PICKUP OK BLU!  "); thread_sleep_for(200); enter(5); } break;
+                }
+                default: pc.printf("[FAULT-BLU] bad sub4=%d\r\n",sub4); op=false; break;
+            }
+            break;
+        }
+
+        case 5:{   // BACK — diagonal LEFT-back (sub0) + spin CW (sub1)  ← BLUE
+            switch(sub5){
+                case 0:{
+                    if(first){ first=false; pc.printf("[BACK-BLU sub0] diag LEFT-back %lums  [mirror of RED right-back]\r\n",(unsigned long)DIAG_MS); lprintf(1,0,"DIAG L-BACK BLU "); t0=us_ticker_read()/1000; }
+                    if(sms()>DIAG_MS){ pc.printf("[FAULT-BLU] diag timeout\r\n"); op=false; break; }
+                    if(sms()>=DIAG_MS){ motors_stop(); lprintf(1,0,"DIAG done BLU   "); thread_sleep_for(80); sub5=1; t0=us_ticker_read()/1000; first=true; break; }
+                    drive_diagonal_BL(MOVE_SPD*1.5);   // -spd = diagonal LEFT-back  ← BLUE
+                    lprintf(1,0,"DIAGL t:%lu/%lu ",(unsigned long)sms(),(unsigned long)DIAG_MS);
+                    break;
+                }
+                case 1:{
+                    if(first){ first=false; pc.printf("[BACK-BLU sub1] spin CW %lums  [mirror of RED CCW]\r\n",(unsigned long)TURN_45_MS); lprintf(1,0,"SPIN CW BLU     "); t0=us_ticker_read()/1000; }
+                    if(sms()>TURN_45_MS+500){ pc.printf("[FAULT-BLU] spin timeout\r\n"); op=false; break; }
+                    if(sms()>=TURN_45_MS){ motors_stop(); lprintf(1,0,"SPIN done BLU   "); thread_sleep_for(200); sub5=0; enter(6); break; }
+                    drive_spin(MOVE_SPD*2);   // -spd = CW  ← BLUE
+                    lprintf(1,0,"CW  t:%lu/%lu   ",(unsigned long)sms(),(unsigned long)TURN_45_MS);
+                    break;
+                }
+                default: pc.printf("[FAULT-BLU] bad sub5=%d\r\n",sub5); op=false; break;
+            }
+            break;
+        }
+
+        case 6:{   // ROT_90
+            if(first) {
+                first=false;
+                pc.printf("[ROT-RED] ->90deg CW\r\n");
+                lprintf(1,0,"Rotating RED... ");
+                rot_to_90();
+                pc.printf("[ROT-RED] done PA0=%d\r\n", sw_90.read());
+                lprintf(1,0,"Rot OK PA0=%d R ", sw_90.read());
+                thread_sleep_for(300);
+                enter(7);
+            }
+        }
+
+        case 7:{   // CYL1 DOWN → CYL4 EXTEND — identical to RED
+            switch(sub7){
+                case S7_CYL1_DOWN:{
+                    if(first){ first=false; sub_t0=us_ticker_read()/1000; cyl_arm=1; pc.printf("[S7_CYL1-BLU] DOWN wait %lums\r\n",(unsigned long)CYL_ARM_MS); lprintf(1,0,"CYL1 DOWN BLU   "); }
+                    uint32_t el=us_ticker_read()/1000-sub_t0;
+                    lprintf(1,0,"CYL1 %lu/%lums  ",(unsigned long)el,(unsigned long)CYL_ARM_MS);
+                    if(el>=CYL_ARM_MS){ sub7=S7_CYL4_EXT; sub_t0=us_ticker_read()/1000; first=true; } break;
+                }
+                case S7_CYL4_EXT:{
+                    if(first){ first=false; sub_t0=us_ticker_read()/1000; cyl_dir=1; pc.printf("[S7_CYL4-BLU] extend C4=%d wait %lums\r\n",cyl_dir.read(),(unsigned long)CYL4_MS); lprintf(1,0,"CYL4 ext BLU    "); }
+                    uint32_t el=us_ticker_read()/1000-sub_t0;
+                    lprintf(1,0,"CYL4 %lu/%lums  ",(unsigned long)el,(unsigned long)CYL4_MS);
+                    if(el>=CYL4_MS){ 
+                        // ── CYL4 extended, now HOLD CYL4+CYL2 for 10 seconds ──
+                        cyl_grip=1; cyl_dir=1;  // Ensure both held
+                        pc.printf("[S7_HOLD-BLU] START 10s blocking wait (C4+Grip)\r\n"); 
+                        lprintf(1,0,"HOLD 10s BLU... "); 
+                        thread_sleep_for(600000);  // ← SIMPLE BLOCKING WAIT
+                        pc.printf("[S7_HOLD-BLU] done C1=%d C2=%d C4=%d\r\n",cyl_arm.read(),cyl_grip.read(),cyl_dir.read()); 
+                        lprintf(1,0,"HOLD OK BLU!    "); 
+                        thread_sleep_for(200); 
+                        enter(8);  // → proceed to case 8
+                    } 
+                    break;
+                }
+                default: pc.printf("[FAULT-BLU] bad sub7=%d\r\n",sub7); op=false; break;
+            }
+            break;
+        }
+
+        case 8:{   // RETRACT CYL2 + CYL4 → DONE — BLUE
+            if(first){ 
+                first=false; 
+                sub_t0=us_ticker_read()/1000; 
+                cyl_grip=0;  // CYL2: OPEN/release
+                cyl_dir=0;   // CYL4: RETRACT
+                pc.printf("[S8-BLU] Retract C2+C4 START\r\n"); 
+                lprintf(1,0,"C2+C4 retract.. "); 
+            }
+            uint32_t el=us_ticker_read()/1000-sub_t0;
+            lprintf(1,0,"Ret %lu/1000ms  ",(unsigned long)el);
+    
+            if(el>=1000){  // Wait 1s for cylinders to settle
+                motors_stop();
+                pc.printf("[S8-BLU] done C1=%d C2=%d C4=%d\r\n",cyl_arm.read(),cyl_grip.read(),cyl_dir.read()); 
+                lprintf(1,0,"DONE BLU!       "); 
+                thread_sleep_for(200);
+                pc.printf("[DONE-BLU] sequence complete\r\n"); 
+                lprintf(0,0,"DONE BLUE       "); 
+                lprintf(1,0,"Sequence OK BLU "); 
+                op=false; 
+            }
+            break;
+        }
+
+        case 9:{   // HOLD — identical to RED
+            lprintf(1,0,"hold %lus/10 BLU",(unsigned long)sms()/1000);
+            if(sms()%1000<50) pc.printf("[HOLD-BLU] %lus/10\r\n",(unsigned long)sms()/1000);
+            if(sms()>=HOLD_MS){ pc.printf("[DONE-BLU] complete\r\n"); lprintf(0,0,"DONE BLUE       "); lprintf(1,0,"Sequence OK BLU "); op=false; }
+            break;
+        }
+        default: pc.printf("[FAULT-BLU] bad state %d\r\n",(int)mode); op=false; break;
+        }
+
+        ptick++;
+        if(ptick>=50){
+            ptick=0;
+            const char* sn=(mode>=1&&mode<=8)?SN[mode]:"?";
+            pc.printf("[BLU %-8s %2lus] S1:%.1f EL:%ld ER:%ld spd:%.2f C1:%d C2:%d C4:%d s4:%d s7:%d\r\n",
+                      sn,(unsigned long)sms()/1000,(double)d1,(long)enc_left,(long)enc_right,
+                      (double)spd,cyl_arm.read(),cyl_grip.read(),cyl_dir.read(),sub4,sub7);
+        }
+        thread_sleep_for(10);
+    }
+    motors_stop(); rot_brake();
+    pc.printf("[RUN] run_normal_blue complete\r\n");
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 10 — RETRY STUBS                                                ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+void run_retry_mc(int zone) {
+    lprintf(0,0,"RETRY MC        ");
+    lprintf(1,0,"%s->Forest      ",(zone==ZONE_RED)?"RED":"BLU");
+    pc.printf("[RETRY_MC] stub zone=%s\r\n",(zone==ZONE_RED)?"RED":"BLUE");
+}
+
+void run_retry_arn(int zone) {
+    lprintf(0,0,"RETRY ARENA     ");
+    lprintf(1,0,"%s->TTT         ",(zone==ZONE_RED)?"RED":"BLU");
+    pc.printf("[RETRY_ARN] stub zone=%s\r\n",(zone==ZONE_RED)?"RED":"BLUE");
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 11 — DISPATCH  (zone from PC_3)                                 ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+void dispatch(int zone, int mode) {
+    pc.printf("[DISPATCH] PC3=%d zone=%s mode=%d\r\n",
+              zone_sw.read(),(zone==ZONE_RED)?"RED":"BLUE",mode);
+    if(zone==ZONE_RED){
+        switch(mode){
+            case MODE_NORMAL:    run_normal_red ();           break;
+            case MODE_RETRY_MC:  run_retry_mc   (ZONE_RED);  break;
+            case MODE_RETRY_ARN: run_retry_arn  (ZONE_RED);  break;
+            default:             run_normal_red ();           break;
+        }
+    } else {
+        switch(mode){
+            case MODE_NORMAL:    run_normal_blue();           break;
+            case MODE_RETRY_MC:  run_retry_mc   (ZONE_BLUE); break;
+            case MODE_RETRY_ARN: run_retry_arn  (ZONE_BLUE); break;
+            default:             run_normal_blue();           break;
+        }
+    }
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 12 — MAIN                                                       ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+int main() {
+
+    cyl_arm  = 0;
+    cyl_grip = 0;
+    cyl_dir  = 0;   // CYL4 PA_6 safe LOW at boot
+    rot_pwm.period(0.0001f);
+    rot_brake();
+
+    bool lcd_ok = lcd_detect();
+    if(lcd_ok) lcd_init();
+    else pc.printf("[WARN] LCD not found\r\n");
+    thread_sleep_for(50);
+
+    pc.printf("\r\n=== R2 Robocon 2026 ===\r\n");
+    pc.printf("RED : FWD -> LEFT  -> FWD -> diag-RIGHT-BACK -> spin-CCW\r\n");
+    pc.printf("BLUE: FWD -> RIGHT -> FWD -> diag-LEFT-BACK  -> spin-CW\r\n");
+    pc.printf("ZONE PC3=%d (%s)\r\n",zone_sw.read(),(zone_sw.read()==0)?"RED":"BLUE");
+    pc.printf("CYL4_MS=%lu  DIAG_MS=%lu  TURN_MS=%lu\r\n",
+              (unsigned long)CYL4_MS,(unsigned long)DIAG_MS,(unsigned long)TURN_45_MS);
+
+    if(can.frequency(1000000)==0){
+        pc.printf("[FATAL] CAN init failed\r\n");
+        while(1){ led=!led; thread_sleep_for(100); }
+    }
+    can.attach(&on_can_rx, CAN::RxIrq);
+    can.filter(0x100, 0x700, CANStandard, 0);
+
+    for(int i=0;i<NUM_W;i++){
+        can_enter_mode(CAN_FL+i);
+        pc.printf("[OK] motor ID%d\r\n",CAN_FL+i);
+    }
+    motors_stop();
+
+    lprintf(0,0,"R2 Robocon 2026 ");
+    lprintf(1,0,"PC3:%s Ready    ",(zone_sw.read()==0)?"RED ":"BLUE");
+    thread_sleep_for(1000);
+
+    while(true){
+        op_mode();
+        dispatch(g_zone, g_mode);
+        lprintf(0,0,"RUN COMPLETE    ");
+        lprintf(1,0,"IR for next run ");
+        pc.printf("[MAIN] done. IR to restart.\r\n\r\n");
+        while(ir_sens.read()==1){ led=!led; thread_sleep_for(300); }
+        thread_sleep_for(500);
+    }
+}
+
+/* =============================================================================
+   RED vs BLUE — exactly 3 lines differ in the state machine:
+
+   State │ Code line               │ RED value       │ BLUE value
+   ──────┼─────────────────────────┼─────────────────┼─────────────────────
+   3     │ motors_drive(ROW, SPD)  │ row 2 = LEFT    │ row 0 = RIGHT
+   5 s0  │ drive_diagonal(±SPD)    │ +MOVE_SPD       │ -MOVE_SPD
+         │                         │ right-back diag  │ left-back diag
+   5 s1  │ drive_spin(±SPD)        │ +MOVE_SPD = CCW  │ -MOVE_SPD = CW
+   ============================================================================= */
